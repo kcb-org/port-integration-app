@@ -11,7 +11,7 @@ import base64
 
 with st.sidebar:
     st.markdown("---")
-    st.write("**제작자:** [김창보, 이종태]")
+    st.write("**제작자:** [김창보, 김성호, 남도현, 백서연]")
     st.write("**소속:** [다온기술]")
     st.caption("© 2026 All rights reserved.")
 
