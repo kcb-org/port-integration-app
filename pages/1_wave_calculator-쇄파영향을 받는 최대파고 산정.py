@@ -20,7 +20,7 @@ st.set_page_config(page_title="최대파고 산정 프로그램", layout="wide",
 
 with st.sidebar:
     st.markdown("---")
-    st.write("**제작자:** [김창보, 홍운철]")
+    st.write("**제작자:** [김창보, 홍운철, 한승우, 김건오, 송호진]")
     st.write("**소속:** [다온기술]")
     st.caption("© 2026 All rights reserved.")
 
