@@ -227,7 +227,7 @@ with st.sidebar:
     st.header("⚙️ 설계 방법 선택")
     design_method = st.radio("방법 분기", ["결정론적 설계법", "신뢰성 설계법"], label_visibility="collapsed")
     st.markdown("---")
-    st.write("**제작:** [다온기술(주), 김창보, 이종태]")
+    st.write("**제작:** [다온기술(주), 김창보, 오창현, 이근형, 정현재]")
     st.write("**기반:** [혼성제 사석부 피복재 안정질량 산정 시스템]")
     st.markdown("---")
 
