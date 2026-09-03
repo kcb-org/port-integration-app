@@ -1,6 +1,12 @@
 import streamlit as st
 import math
 import pandas as pd
+import io
+import base64
+import re
+import urllib.parse
+import concurrent.futures
+import textwrap
 
 with st.sidebar:
     st.markdown("---")
@@ -520,9 +526,9 @@ if 'method3_detail' not in locals():
     Uc3 = 0.0
 
 # =====================================================================
-# ★ 통합 HTML 템플릿 구성 (1번 섹션에 전체 표 및 상세 내용 포함)
+# ★ 통합 HTML 템플릿 구성 (Raw f-string 적용으로 LaTeX 백슬래시 깨짐 방지)
 # =====================================================================
-html_report = f"""
+html_report = rf"""
 <!DOCTYPE html>
 <html>
 <head>
@@ -534,24 +540,35 @@ html_report = f"""
     <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
     <style>
         body {{ font-family: 'Malgun Gothic', '맑은 고딕', sans-serif; line-height: 1.6; padding: 30px; color: #333; max-width: 1000px; margin: auto; }}
-        h1 {{ color: #1e3a8a; border-bottom: 3px solid #1e3a8a; padding-bottom: 10px; text-align: center; margin-bottom: 40px; }}
-        h2 {{ color: #2563eb; margin-top: 40px; border-bottom: 2px solid #ddd; padding-bottom: 5px; font-size: 1.4em; }}
-        h3 {{ color: #1e3a8a; font-size: 1.1em; margin-top: 25px; }}
-        .result-box {{ background-color: #f0fdf4; border: 1px solid #bbf7d0; padding: 15px; border-radius: 5px; font-size: 1.3em; font-weight: bold; color: #166534; text-align: center; margin: 20px 0; box-shadow: 0 2px 4px rgba(0,0,0,0.05); }}
-        .info-box {{ background-color: #e8f0fe; border-left: 4px solid #1e3a8a; padding: 15px; margin: 15px 0; font-size: 0.95em; }}
-        .eq {{ background: #f8fafc; padding: 12px; border-radius: 5px; text-align: center; margin: 15px 0; overflow-x: auto; border: 1px solid #e2e8f0; }}
-        .step-title {{ font-weight: bold; color: #333; margin-bottom: 5px; font-size: 1.05em; }}
-        table {{ width: 100%; border-collapse: collapse; margin-top: 10px; text-align: center; font-size: 0.95em; }}
-        th, td {{ border: 1px solid #ddd; padding: 10px; }}
+        h1 {{ color: #1e3a8a; border-bottom: 3px solid #1e3a8a; padding-bottom: 10px; text-align: center; margin-bottom: 30px; }}
+        h2 {{ color: #2563eb; margin-top: 40px; border-bottom: 2px solid #ddd; padding-bottom: 5px; font-size: 1.3em; }}
+        h3 {{ color: #1e3a8a; font-size: 1.05em; margin-top: 20px; }}
+        .result-box {{ background-color: #f0fdf4; border: 1px solid #bbf7d0; padding: 12px; border-radius: 5px; font-size: 1.2em; font-weight: bold; color: #166534; text-align: center; margin: 15px 0; }}
+        .info-box {{ background-color: #e8f0fe; border-left: 4px solid #1e3a8a; padding: 12px; margin: 12px 0; font-size: 0.95em; }}
+        .source-box {{ background-color: #f0f7ff; border: 1px solid #cce5ff; border-left: 5px solid #0056b3; padding: 12px; border-radius: 4px; margin: 12px 0; font-size: 0.9em; line-height: 1.5; }}
+        .eq {{ background: #f8fafc; padding: 10px; border-radius: 5px; text-align: center; margin: 12px 0; overflow-x: auto; border: 1px solid #e2e8f0; }}
+        .step-title {{ font-weight: bold; color: #333; margin-bottom: 5px; font-size: 1.0em; }}
+        table {{ width: 100%; border-collapse: collapse; margin-top: 10px; text-align: center; font-size: 0.9em; }}
+        th, td {{ border: 1px solid #ddd; padding: 8px; }}
         th {{ background-color: #eff6ff; color: #1e3a8a; }}
     </style>
 </head>
 <body>
     <h1>🌊 점성토 세굴 한계유속 통합 산정 보고서</h1>
     
+    <p>사질토(모래)는 '무게와 입경'으로 세굴을 버티지만, 점성토(진흙)는 입자 간의 <b>물리화학적 결합력(점착력)</b>으로 버팁니다. 현장의 데이터 보유 상황에 따른 3가지 산정 방법의 비교 결과 및 상세 계산 결과는 다음과 같습니다.</p>
+    
+    <h2>종합 비교 및 방법론 선택 가이드</h2>
+    {comparison_html}
+    
     <h2>1. [기본] 경험적 허용유속 표 산정 (Fortier & Scobey 원본 기준)</h2>
+    <div class="source-box">
+        <b>📖 문헌 출처 및 이론적 배경:</b><br>
+        &bull; <b>논문명:</b> Permissible Canal Velocities (Transactions of the ASCE, Vol. 89, pp. 940-956, 1926)<br>
+        &bull; <b>저자:</b> Samuel Fortier, Fred C. Scobey<br>
+        &bull; <b>특징:</b> 수로 구성 토질과 흐르는 물의 상태에 따른 최대 허용 유속을 실측 기반 데이터 표로 제시한 표준 기준입니다.
+    </div>
     <div class="info-box">
-        <b>문헌 출처:</b> Transactions of the ASCE, Vol. 89, pp. 940-956 (1926)<br>
         <b>선택된 수로 토질:</b> {sel_material}<br>
         <b>흐르는 물의 상태:</b> {sel_water_cond}
     </div>
@@ -561,7 +578,13 @@ html_report = f"""
     
     <div class="result-box">적용 허용 유속 = {res_ms:.2f} m/s ({res_ft:.2f} ft/s)</div>
     
-    <h2>2. [중급] 한계소류력 기반 유속 역산법 (Smerdon & Beasley)</h2>
+    <h2>2. [중급] 한계소류력 기반 유속 역산법 (Smerdon & Beasley, 1961)</h2>
+    <div class="source-box">
+        <b>📖 문헌 출처 및 이론적 배경:</b><br>
+        &bull; <b>논문명:</b> Critical Tractive Forces in Cohesive Soils (Agricultural Engineering, Vol. 42, No. 1, pp. 26-29, 1961)<br>
+        &bull; <b>저자:</b> E. T. Smerdon, R. P. Beasley<br>
+        &bull; <b>특징:</b> 소성지수(PI)와 지수가공된 한계소류력($\tau_c = 0.16 \cdot PI^{{0.84}}$)의 상관관계를 도출하고, Manning 공식과 연립하여 한계유속을 역산합니다.
+    </div>
     <table>
         <tr><th>소성지수 (PI)</th><th>조도계수 (n)</th><th>경심 (R)</th></tr>
         <tr><td>{pi_val:.1f} %</td><td>{n_val:.3f}</td><td>{R_val:.1f} m</td></tr>
@@ -570,14 +593,20 @@ html_report = f"""
     <div class="result-box">최종 한계유속 (Uc) = {vc_calc:.3f} m/s</div>
     
     <h3>수식 전개 및 상세 연산 과정</h3>
-    <p class="step-title">Step 1. 소성지수를 이용한 한계소류력($\\tau_c$) 산정</p>
-    <div class="eq">$$ \\tau_c = 0.16 \\times (PI)^{{0.84}} = 0.16 \\times ({pi_val:.1f})^{{0.84}} = {tau_psf:.3f} \\text{{ psf}} $$</div>
-    <div class="eq">$$ \\tau_c \\text{{ (Pa)}} = {tau_psf:.3f} \\times 47.88 = {tau_pa:.2f} \\text{{ Pa}} $$</div>
+    <p class="step-title">Step 1. 소성지수를 이용한 한계소류력($\tau_c$) 산정</p>
+    <div class="eq">$$ \tau_c = 0.16 \times (PI)^{{0.84}} = 0.16 \times ({pi_val:.1f})^{{0.84}} = {tau_psf:.3f} \text{{ psf}} $$</div>
+    <div class="eq">$$ \tau_c \text{{ (Pa)}} = {tau_psf:.3f} \times 47.88 = {tau_pa:.2f} \text{{ Pa}} $$</div>
     
     <p class="step-title">Step 2. Manning 공식을 이용한 한계유속($V_c$) 역산</p>
-    <div class="eq">$$ V_c = \\frac{{1}}{{n}} R^{{1/6}} \\sqrt{{\\frac{{\\tau_c}}{{\\gamma_w}}}} = \\frac{{1}}{{{n_val:.3f}}} \\times ({R_val:.1f})^{{1/6}} \\times \\sqrt{{\\frac{{{tau_pa:.2f}}}{{9810}}}} = {vc_calc:.3f} \\text{{ m/s}} $$</div>
+    <div class="eq">$$ V_c = \frac{{1}}{{n}} R^{{1/6}} \sqrt{{\frac{{\tau_c}}{{\gamma_w}}}} = \frac{{1}}{{{n_val:.3f}}} \times ({R_val:.1f})^{{1/6}} \times \sqrt{{\frac{{{tau_pa:.2f}}}{{9810}}}} = {vc_calc:.3f} \text{{ m/s}} $$</div>
     
-    <h2>3. [고급] 점성토 전용 한계유속 이론식 (Mirtskhoulava)</h2>
+    <h2>3. [고급] 점성토 전용 한계유속 이론식 (Mirtskhoulava, 1988)</h2>
+    <div class="source-box">
+        <b>📖 문헌 출처 및 이론적 배경:</b><br>
+        &bull; <b>논문명:</b> Osnovy fiziki i mekhaniki erozii rusel (Gidrometeoizdat, Leningrad, 1988)<br>
+        &bull; <b>저자:</b> C. E. Mirtskhoulava<br>
+        &bull; <b>특징:</b> 난류 맥동에 의한 피로 파괴로 점성토 입자가 덩어리째 떨어져 나가는 메커니즘을 물리 방정식으로 구현한 정밀 이론식입니다.
+    </div>
     <table>
         <tr><th>수심 (h)</th><th>토질 분류</th><th>Liquidity Index</th><th>공극율</th><th>해수 밀도(ρ)</th><th>흙 밀도(ρs)</th><th>입경(da)</th></tr>
         <tr>
@@ -596,11 +625,136 @@ html_report = f"""
 </body>
 </html>
 """
+# =====================================================================
+# ★ 초고속 수식 이미지 다운로드 캐시 및 MHTML 변환 엔진 (MS Word 호환)
+# =====================================================================
+@st.cache_data(show_spinner=False)
+def fetch_equation_image(api_url):
+    try:
+        req = urllib.request.Request(api_url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=5) as response:
+            return base64.b64encode(response.read()).decode('utf-8')
+    except Exception:
+        return None
 
-st.download_button(
-    label="💾 통합 산정 보고서 다운로드 (.html)",
-    data=html_report.encode('utf-8'),
-    file_name="점성토_한계유속_통합_산정보고서.html",
-    mime="text/html",
-    use_container_width=True
-)
+@st.cache_data(show_spinner=False)
+def convert_html_to_mhtml(html_content):
+    word_html = html_content
+    attachments = {}
+    counters = {'img': 0, 'eq': 0}
+
+    word_html = re.sub(r'<script.*?</script>', '', word_html, flags=re.DOTALL)
+    word_html = word_html.replace('<table', '<table style="border-collapse: collapse; width: 100%; border: 1px solid black; margin-bottom: 25px;"')
+    word_html = word_html.replace('<th>', '<th style="border: 1px solid black; padding: 8px; background-color: #f1f8ff; text-align: center;">')
+    word_html = word_html.replace('<td>', '<td style="border: 1px solid black; padding: 8px; text-align: center;">')
+
+    def image_replacer(match):
+        b64_data = match.group(1)
+        counters['img'] += 1
+        img_id = f"embedded_img_{counters['img']}"
+        attachments[img_id] = b64_data
+        return f'<img src="cid:{img_id}" style="max-width: 100%; height: auto;">'
+    
+    word_html = re.sub(r'src=["\']data:image/[a-zA-Z]+;base64,([^\'"]+)["\']', image_replacer, word_html)
+
+    display_maths = re.findall(r'\$\$(.*?)\$\$', word_html, flags=re.DOTALL)
+    inline_maths = re.findall(r'\$([^\$]+)\$', word_html)
+    urls_to_fetch = set()
+    
+    def prepare_url(eq_text, is_display):
+        eq_c = re.sub(r'\\text\{([^}]+)\}', lambda m: "" if re.search(r'[가-힣]', m.group(1)) else m.group(0), eq_text)
+        eq_c = eq_c.replace(r'\max', 'max').replace(r'\min', 'min').replace(r'\mathbf', '')
+        dpi = "110" if is_display else "100"
+        return f"https://latex.codecogs.com/png.image?\\dpi{{{dpi}}}\\bg_white&space;{urllib.parse.quote(eq_c)}"
+    
+    for eq in display_maths: urls_to_fetch.add(prepare_url(eq.strip(), True))
+    for eq in inline_maths:
+        txt = eq.strip()
+        if any(op in txt for op in ["\\", "=", "+", "-", "/", "times", "ge", "le", "<", ">", "^", "_"]):
+            urls_to_fetch.add(prepare_url(txt, False))
+            
+    with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
+        list(executor.map(fetch_equation_image, urls_to_fetch))
+
+    def render_math_to_img(eq_text, is_display):
+        korean_parts = []
+        def kr_replacer(m):
+            txt = m.group(1)
+            if re.search(r'[가-힣]', txt):
+                korean_parts.append(txt)
+                return ""
+            return m.group(0)
+        eq_c = re.sub(r'\\text\{([^}]+)\}', kr_replacer, eq_text)
+        eq_c = eq_c.replace(r'\max', 'max').replace(r'\min', 'min').replace(r'\mathbf', '')
+        
+        api_url = prepare_url(eq_text, is_display)
+        counters['eq'] += 1
+        img_id = f"eq_img_{counters['eq']}"
+        b64_img = fetch_equation_image(api_url)
+        
+        if b64_img:
+            attachments[img_id] = b64_img
+            img_tag = f"<img src='cid:{img_id}' style='vertical-align: middle; border: none; max-width: 100%;'>"
+        else:
+            img_tag = f"<img src='{api_url}' style='vertical-align: middle; border: none; max-width: 100%;'>"
+        
+        kr_addon = f"<span style='margin-left:5px; font-weight:bold; color:#555;'>[{' '.join(korean_parts)}]</span>" if korean_parts else ""
+        return img_tag, kr_addon
+
+    def display_math_replacer(match):
+        img_tag, kr_addon = render_math_to_img(match.group(1).strip(), True)
+        return f'<table align="center" style="border-collapse: collapse; border: none; margin: 10px auto; width: 100%;"><tr><td style="border: none; padding: 0; text-align: center;">{img_tag} {kr_addon}</td></tr></table>'
+    word_html = re.sub(r'\$\$(.*?)\$\$', display_math_replacer, word_html, flags=re.DOTALL)
+
+    def inline_math_replacer(match):
+        eq_text = match.group(1).strip()
+        if any(op in eq_text for op in ["\\", "=", "+", "-", "/", "times", "ge", "le", "<", ">", "^", "_"]):
+            img_tag, kr_addon = render_math_to_img(eq_text, False)
+            return f"{img_tag}{kr_addon}"
+        else:
+            return f"${eq_text}$"
+    word_html = re.sub(r'\$([^\$]+)\$', inline_math_replacer, word_html)
+    word_html = re.sub(r'\$([a-zA-Z]+)_([a-zA-Z0-9\+\-]+)\$', r'\1<sub>\2</sub>', word_html)
+    word_html = word_html.replace('$', '')
+
+    boundary = "----=_NextPart_HTML_DOC_001"
+    mhtml = f'MIME-Version: 1.0\nContent-Type: multipart/related; type="text/html"; boundary="{boundary}"\n\n'
+    mhtml += f'--{boundary}\nContent-Type: text/html; charset="utf-8"\nContent-Transfer-Encoding: 8bit\n\n'
+    
+    mhtml_body = word_html.replace("<html", "<html xmlns:o='urn:schemas-microsoft-com:office:office' xmlns:w='urn:schemas-microsoft-com:office:word'")
+    mhtml_body = mhtml_body.replace("<head>", "<head><meta http-equiv='Content-Type' content='text/html; charset=utf-8'>")
+    
+    mhtml += mhtml_body + "\n\n"
+    for cid, b64 in attachments.items():
+        formatted_b64 = '\n'.join(textwrap.wrap(b64, 76))
+        mhtml += f'--{boundary}\nContent-Type: image/png\nContent-Transfer-Encoding: base64\nContent-ID: <{cid}>\n\n{formatted_b64}\n\n'
+    mhtml += f"--{boundary}--\n"
+    return mhtml
+
+# =====================================================================
+# ★ 통합 보고서 다운로드 렌더링 (HTML웹용 및 MS Word용 양방향 제공)
+# =====================================================================
+st.divider()
+st.header("🖨️ 종합 산정 보고서 다운로드")
+st.info("💡 **초고속 병렬 다운로드 엔진 적용:** 화면에 구성된 모든 비교표와 3가지 산정 방법론 결과가 포함된 HTML 및 MS Word용 보고서를 즉시 생성합니다.")
+
+with st.spinner("보고서용 수식과 표를 변환 중입니다..."):
+    mhtml_data = convert_html_to_mhtml(html_report)
+
+col_d1, col_d2 = st.columns(2)
+with col_d1:
+    st.download_button(
+        label="📄 산정 보고서 다운로드 (HTML웹용)", 
+        data=html_report.encode('utf-8'), 
+        file_name="점성토_한계유속_통합_산정보고서.html", 
+        mime="text/html", 
+        use_container_width=True
+    )
+with col_d2:
+    st.download_button(
+        label="📝 산정 보고서 다운로드 (MS Word용)", 
+        data=mhtml_data.encode('utf-8'), 
+        file_name="점성토_한계유속_통합_산정보고서.doc", 
+        mime="application/msword", 
+        use_container_width=True
+    )
