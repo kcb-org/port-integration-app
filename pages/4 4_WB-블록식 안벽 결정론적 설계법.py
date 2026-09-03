@@ -8,6 +8,10 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 import io
 import base64
+import re
+import urllib.parse
+import concurrent.futures
+import textwrap
 
 with st.sidebar:
     st.markdown("---")
@@ -93,9 +97,110 @@ class ReportBuilder:
     def get_html(self):
         return self.html + "</body></html>"
 
+    def get_mhtml(self):
+        word_html = self.get_html()
+        attachments = {}
+        counters = {'img': 0, 'eq': 0}
+
+        word_html = re.sub(r'<script.*?</script>', '', word_html, flags=re.DOTALL)
+        word_html = word_html.replace('<table', '<table style="border-collapse: collapse; width: 100%; border: 1px solid black; margin-bottom: 25px;"')
+        word_html = word_html.replace('<th>', '<th style="border: 1px solid black; padding: 8px; background-color: #f4f6f8; text-align: center;">')
+        word_html = word_html.replace('<td>', '<td style="border: 1px solid black; padding: 8px; text-align: center;">')
+
+        def image_replacer(match):
+            b64_data = match.group(1)
+            counters['img'] += 1
+            img_id = f"embedded_img_{counters['img']}"
+            attachments[img_id] = b64_data
+            return f'<img src="cid:{img_id}" width="750" style="max-width: 100%;">'
+        
+        word_html = re.sub(r'src=["\']data:image/[a-zA-Z]+;base64,([^\'"]+)["\']', image_replacer, word_html)
+
+        display_maths = re.findall(r'\$\$(.*?)\$\$', word_html, flags=re.DOTALL)
+        inline_maths = re.findall(r'\$([^\$]+)\$', word_html)
+        urls_to_fetch = set()
+        
+        def prepare_url(eq_text, is_display):
+            eq_c = re.sub(r'\\text\{([^}]+)\}', lambda m: "" if re.search(r'[가-힣]', m.group(1)) else m.group(0), eq_text)
+            eq_c = eq_c.replace(r'\max', 'max').replace(r'\min', 'min').replace(r'\mathbf', '')
+            dpi = "110" if is_display else "100"
+            return f"https://latex.codecogs.com/png.image?\\dpi{{{dpi}}}\\bg_white&space;{urllib.parse.quote(eq_c)}"
+        
+        for eq in display_maths: urls_to_fetch.add(prepare_url(eq.strip(), True))
+        for eq in inline_maths:
+            txt = eq.strip()
+            if any(op in txt for op in ["\\", "=", "+", "-", "/", "times", "ge", "le", "<", ">", "^", "_"]):
+                urls_to_fetch.add(prepare_url(txt, False))
+                
+        with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
+            list(executor.map(fetch_equation_image, urls_to_fetch))
+
+        def render_math_to_img(eq_text, is_display):
+            korean_parts = []
+            def kr_replacer(m):
+                txt = m.group(1)
+                if re.search(r'[가-힣]', txt):
+                    korean_parts.append(txt)
+                    return ""
+                return m.group(0)
+            eq_c = re.sub(r'\\text\{([^}]+)\}', kr_replacer, eq_text)
+            eq_c = eq_c.replace(r'\max', 'max').replace(r'\min', 'min').replace(r'\mathbf', '')
+            
+            api_url = prepare_url(eq_text, is_display)
+            counters['eq'] += 1
+            img_id = f"eq_img_{counters['eq']}"
+            b64_img = fetch_equation_image(api_url)
+            
+            if b64_img:
+                attachments[img_id] = b64_img
+                img_tag = f"<img src='cid:{img_id}' style='vertical-align: middle; border: none; max-width: 100%;'>"
+            else:
+                img_tag = f"<img src='{api_url}' style='vertical-align: middle; border: none; max-width: 100%;'>"
+            
+            kr_addon = f"<span style='margin-left:5px; font-weight:bold; color:#555;'>[{' '.join(korean_parts)}]</span>" if korean_parts else ""
+            return img_tag, kr_addon
+
+        def display_math_replacer(match):
+            img_tag, kr_addon = render_math_to_img(match.group(1).strip(), True)
+            return f'<table align="center" style="border-collapse: collapse; border: none; margin: 10px auto; width: 100%;"><tr><td style="border: none; padding: 0; text-align: center;">{img_tag} {kr_addon}</td></tr></table>'
+        word_html = re.sub(r'\$\$(.*?)\$\$', display_math_replacer, word_html, flags=re.DOTALL)
+
+        def inline_math_replacer(match):
+            eq_text = match.group(1).strip()
+            if any(op in eq_text for op in ["\\", "=", "+", "-", "/", "times", "ge", "le", "<", ">", "^", "_"]):
+                img_tag, kr_addon = render_math_to_img(eq_text, False)
+                return f"{img_tag}{kr_addon}"
+            else:
+                return f"${eq_text}$"
+        word_html = re.sub(r'\$([^\$]+)\$', inline_math_replacer, word_html)
+        word_html = re.sub(r'\$([a-zA-Z]+)_([a-zA-Z0-9\+\-]+)\$', r'\1<sub>\2</sub>', word_html)
+        word_html = word_html.replace('$', '')
+
+        boundary = "----=_NextPart_HTML_DOC_001"
+        mhtml = f'MIME-Version: 1.0\nContent-Type: multipart/related; type="text/html"; boundary="{boundary}"\n\n'
+        mhtml += f'--{boundary}\nContent-Type: text/html; charset="utf-8"\nContent-Transfer-Encoding: 8bit\n\n'
+        mhtml += word_html + "\n\n"
+        
+        for cid, b64 in attachments.items():
+            formatted_b64 = '\n'.join(textwrap.wrap(b64, 76))
+            mhtml += f'--{boundary}\nContent-Type: image/png\nContent-Transfer-Encoding: base64\nContent-ID: <{cid}>\n\n{formatted_b64}\n\n'
+        mhtml += f"--{boundary}--\n"
+        return mhtml
 
 # =====================================================================
-# ★ 3. 하중 모식도 시각화 함수 (가상배면 a' 및 라벨 자동화)
+# ★ 초고속 수식 이미지 다운로드 캐시 (MS Word 변환용)
+# =====================================================================
+@st.cache_data(show_spinner=False)
+def fetch_equation_image(api_url):
+    try:
+        req = urllib.request.Request(api_url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=5) as response:
+            return base64.b64encode(response.read()).decode('utf-8')
+    except Exception:
+        return None
+
+# =====================================================================
+# ★ 3. 하중 모식도 시각화 함수
 # =====================================================================
 
 def draw_schematic(tiers_df, c_top, hwl_n, rwl_n, llw):
@@ -124,13 +229,8 @@ def draw_schematic(tiers_df, c_top, hwl_n, rwl_n, llw):
         buf.seek(0)
         return f"<div class='fig-container'><img src='data:image/png;base64,{base64.b64encode(buf.read()).decode('utf-8')}' style='max-width:100%; height:auto;'></div>"
 
+    # 1. 제체 블록 그리기 및 각 단별 후단 X좌표/단면 정보 수집
     tier_geoms = []
-
-    # 1. 절대 좌표계 (모든 단의 기본 전면을 X=0으로, 돌출만 음수로)
-    x_front_abs = [0.0] * len(valid_tiers)
-    for i in range(len(valid_tiers)):
-        out_h = float(valid_tiers[i].get("전면돌출(m)", 0.0)) if pd.notna(valid_tiers[i].get("전면돌출(m)")) else 0.0
-        x_front_abs[i] = -out_h
 
     for idx, row in enumerate(valid_tiers):
         name = str(row["구분"])
@@ -146,168 +246,159 @@ def draw_schematic(tiers_df, c_top, hwl_n, rwl_n, llw):
         is_first = (idx == 0)
         is_last = (idx == len(valid_tiers) - 1)
 
-        x_front = x_front_abs[idx]
-        x_rear = x_front + b
+        # 블록 전면 X= -out_h, 후단 X= b - out_h
+        x_rear = b - out_h
         max_b = max(max_b, x_rear)
 
-        # (1) 상치부 (a' 라벨 처리는 하단 루프로 이관하여 중복 꼬임 방지)
+        # 콘크리트 블록 폴리곤 그리기 (회색)
         if is_first:
             poly_points = [
-                (x_front, bot_y),
-                (x_rear, bot_y),
-                (x_front + top_b, current_y),
-                (x_front, current_y)
+                (-out_h, bot_y),
+                (-out_h + b, bot_y),
+                (-out_h + top_b, current_y),
+                (-out_h, current_y)
             ]
-            polygon = patches.Polygon(poly_points, closed=True, linewidth=1.5, edgecolor='black', facecolor='#d9d9d9', zorder=4)
+            polygon = patches.Polygon(poly_points, closed=True, linewidth=1.5, edgecolor='black', facecolor='#d9d9d9',
+                                      zorder=3)
             ax.add_patch(polygon)
-            ax.text(x_front + top_b / 2, current_y - h / 2, f"{name}\n(상 {top_b:.1f} / 하 {b:.1f})", ha='center', va='center', fontsize=9, zorder=4)
+            ax.text(-out_h + top_b / 2, current_y - h / 2, f"{name}\n(상 {top_b:.1f} / 하 {b:.1f})", ha='center',
+                    va='center', fontsize=9, zorder=4)
 
-        # (2) 일반 중간 블록
         elif not is_last:
-            rect = patches.Rectangle((x_front, bot_y), b, h, linewidth=1.5, edgecolor='black', facecolor='#d9d9d9', zorder=3)
+            rect = patches.Rectangle((-out_h, bot_y), b, h, linewidth=1.5, edgecolor='black', facecolor='#d9d9d9',
+                                     zorder=3)
             ax.add_patch(rect)
-            ax.text(x_front + b / 2, bot_y + h / 2, f"{name}\n({b:.1f} x {h:.1f})", ha='center', va='center', fontsize=9, zorder=4)
+            ax.text((b / 2) - out_h, bot_y + h / 2, f"{name}\n({b:.1f} x {h:.1f})", ha='center', va='center',
+                    fontsize=9, zorder=4)
 
-        # (3) 최하단 블록 (경사 높이 자동 계산)
         else:
             slope_end_y = current_y - rear_v
-            top_left_x = x_front + out_h
-            
-            p_bottom_left = (x_front, bot_y)
-            p_bottom_right = (x_rear, bot_y)
-            p_top_right = (x_rear, current_y)
-            p_top_left = (top_left_x, current_y)
-            
-            p_slope_end = (top_left_x, slope_end_y) if rear_v > 0 else p_top_left
-            p_vert_end = (x_front, bot_y + toe_v)
+            p_bottom_left = (-out_h, bot_y)
+            p_bottom_right = (b - out_h, bot_y)
+            p_top_right = (b - out_h, current_y)
+            p_top_left = (0.0, current_y)
+            p_slope_end = (0.0, slope_end_y)
+            p_vert_end = (-out_h, bot_y + toe_v)
 
             poly_points = [p_bottom_left, p_bottom_right, p_top_right, p_top_left, p_slope_end, p_vert_end]
-            
-            polygon = patches.Polygon(poly_points, closed=True, linewidth=1.5, edgecolor='black', facecolor='#d9d9d9', zorder=3)
+            polygon = patches.Polygon(poly_points, closed=True, linewidth=1.5, edgecolor='black', facecolor='#d9d9d9',
+                                      zorder=3)
             ax.add_patch(polygon)
 
             if out_h > 0:
-                ax.plot([top_left_x, top_left_x], [bot_y, current_y], color='black', linestyle=':', linewidth=1.2, zorder=4)
+                ax.plot([0, 0], [bot_y, current_y], color='black', linestyle=':', linewidth=1.2, zorder=4)
                 if toe_v > 0:
-                    ax.text(x_front + out_h / 2, bot_y + toe_v / 2, f"{toe_v:.1f}m\n(수직)", fontsize=8, color='darkred', ha='center', va='center', zorder=4)
+                    ax.text(-out_h / 2, bot_y + toe_v / 2, f"{toe_v:.1f}m\n(수직)", fontsize=8, color='darkred',
+                            ha='center', va='center', zorder=4)
                 if rear_v > 0:
-                    ax.text(top_left_x - 0.1, current_y - rear_v / 2, f"{rear_v:.1f}m\n(후단)", fontsize=8, color='darkred', ha='right', va='center', zorder=4)
-                
-                # ★ 경사 높이 자동 연산 기입 로직
-                slope_h = max(0.0, h - toe_v - rear_v)
-                if slope_h > 0.001:
-                    ax.text(x_front + out_h / 2 - 0.1, bot_y + toe_v + slope_h / 2, f"{slope_h:.1f}m\n(경사)", fontsize=8, color='darkred', ha='right', va='center', zorder=4)
+                    ax.text(-0.1, current_y - rear_v / 2, f"{rear_v:.1f}m\n(후단)", fontsize=8, color='darkred',
+                            ha='right', va='center', zorder=4)
 
-            ax.text(top_left_x + (b - out_h) / 2, bot_y + h / 2, f"{name}\n({b:.1f} x {h:.1f})", ha='center', va='center', fontsize=9, zorder=4)
+            ax.text((b - out_h) / 2, bot_y + h / 2, f"{name}\n({b:.1f} x {h:.1f})", ha='center', va='center',
+                    fontsize=9, zorder=4)
 
-        ax.text(x_front - 0.3, current_y, f"DL {current_y:.2f}", ha='right', va='center', fontsize=9, color='blue')
+        # 레벨 표시 (좌측)
+        ax.text(-out_h - 0.3, current_y, f"DL {current_y:.2f}", ha='right', va='center', fontsize=9, color='blue')
         if is_last:
-            ax.text(x_front - 0.3, bot_y, f"DL {bot_y:.2f}", ha='right', va='center', fontsize=9, color='blue')
+            ax.text(-out_h - 0.3, bot_y, f"DL {bot_y:.2f}", ha='right', va='center', fontsize=9, color='blue')
 
         tier_geoms.append({
             'idx': idx, 'name': name,
             'top_y': current_y, 'bot_y': bot_y,
-            'x_front': x_front, 'x_rear': x_rear,
-            'b': b, 'top_b': top_b
+            'x_rear': x_rear
         })
+
         current_y = bot_y
 
-    # ★ 배면 사석 점선 분할 완벽 자동화 (a' 독립화)
-    x_list = []
-    has_a_prime = False
-    for g in tier_geoms:
-        x_list.append(g['x_rear'])
-        if g['idx'] == 0 and g['top_b'] < g['b']:
-            x_list.append(g['x_front'] + g['top_b'])
-            has_a_prime = True
-
-    unique_x = sorted(list(set(x_list)))
+    # 2. ★ 배면 사석 구간(Sub-columns) 계산 및 점선/라벨/치수 그리기 (오류 수정 핵심부)
     rubble_cols = []
 
+    # 각 단의 배면 끝점 X좌표 수집 및 정렬
+    rear_x_list = [g['x_rear'] for g in tier_geoms]
+    unique_x = sorted(list(set(rear_x_list)))
+
+    # X 좌표간 구간을 나누어 사석 기둥 생성
     for i in range(len(unique_x) - 1):
         x1 = unique_x[i]
         x2 = unique_x[i + 1]
         width = x2 - x1
-        if width <= 0.01: continue
+        if width <= 0.01:
+            continue
 
-        x_mid = (x1 + x2) / 2.0
+        # 해당 사석 기둥을 받치고 있는 단(tier)의 상단 Y고(Platform) 찾기
         sub_bot_y = c_top
-        
-        # a' 구간 예외 처리
-        is_a_prime_col = has_a_prime and abs(x1 - (tier_geoms[0]['x_front'] + tier_geoms[0]['top_b'])) < 0.001 and abs(x2 - tier_geoms[0]['x_rear']) < 0.001
-
-        if is_a_prime_col:
-            sub_bot_y = tier_geoms[0]['bot_y']
-        else:
-            for g in tier_geoms:
-                if g['x_front'] - 0.001 <= x_mid <= g['x_rear'] + 0.001:
-                    sub_bot_y = g['top_y']
-                    break
+        for g in tier_geoms:
+            if g['x_rear'] >= x2 - 0.01:
+                sub_bot_y = g['top_y']
+                break
 
         rubble_cols.append({
             'x1': x1, 'x2': x2, 'width': width,
-            'bot_y': sub_bot_y,
-            'is_a_prime': is_a_prime_col
+            'bot_y': sub_bot_y
         })
 
+    # 사석 라벨 알파벳
     lbl_idx = 0
-    # 무한 기호 생성 (a~z, aa~zz)
-    rubble_labels = [chr(i) for i in range(97, 123)] + [chr(i)*2 for i in range(97, 123)]
+    rubble_labels = ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l']
 
     for col in rubble_cols:
         x1 = col['x1']
         x2 = col['x2']
+        x_center = (x1 + x2) / 2.0
         w = col['width']
         bot_y = col['bot_y']
-        is_a_prime = col['is_a_prime']
-        x_center = (x1 + x2) / 2.0
 
-        # 우측 수직 점선
+        # 1) 수직 점선 (마루 DL +4.00부터 해당 사석 바닥까지만 정확히 연장)
         ax.plot([x2, x2], [bot_y, c_top], color='black', linestyle=':', linewidth=1.2, zorder=2)
-        # a' 구간인 경우 좌측 가상배면 수직 점선 추가
-        if is_a_prime:
-            ax.plot([x1, x1], [bot_y, c_top], color='black', linestyle=':', linewidth=1.2, zorder=2)
 
+        # 2) 마루 상단 폭 치수 표기 (예: 2.2, 1.0, 1.0)
         ax.text(x_center, c_top + 0.15, f"{w:.1f}", ha='center', va='bottom', fontsize=9, color='black')
 
-        def get_lbl():
-            nonlocal lbl_idx
-            if is_a_prime: return "a'"
-            lbl = rubble_labels[lbl_idx]
-            lbl_idx += 1
-            return lbl
-
+        # 3) 잔류수위(R.W.L) 기준 수상/수중 라벨의 수직 중앙값(Y Center) 계산 및 텍스트 출력
         if bot_y >= rwl_n:
-            lbl = get_lbl()
+            # 사석 구간 전체가 수위 위에 있는 경우 (수상 사석만 존재)
+            lbl = rubble_labels[lbl_idx % len(rubble_labels)]
             y_center = (c_top + bot_y) / 2.0
-            ax.text(x_center, y_center, lbl, color='red', ha='center', va='center', fontsize=10, fontweight='bold', zorder=5)
+            ax.text(x_center, y_center, lbl, color='red', ha='center', va='center', fontsize=10, fontweight='bold',
+                    zorder=5)
+            lbl_idx += 1
+
         elif c_top <= rwl_n:
-            lbl = get_lbl()
+            # 사석 구간 전체가 수위 아래에 있는 경우 (수중 사석만 존재)
+            lbl = rubble_labels[lbl_idx % len(rubble_labels)]
             y_center = (c_top + bot_y) / 2.0
-            ax.text(x_center, y_center, lbl, color='black', ha='center', va='center', fontsize=10, fontweight='bold', zorder=5)
+            ax.text(x_center, y_center, lbl, color='black', ha='center', va='center', fontsize=10, fontweight='bold',
+                    zorder=5)
+            lbl_idx += 1
+
         else:
-            if is_a_prime:
-                lbl_above = "a'"
-                lbl_below = "a'"
-            else:
-                lbl_above = rubble_labels[lbl_idx]
-                lbl_below = rubble_labels[lbl_idx + 1]
-                lbl_idx += 2
+            # 사석 구간이 수위선에 걸쳐있는 경우 (수상/수중 분할)
+            lbl_above = rubble_labels[lbl_idx % len(rubble_labels)]
+            lbl_below = rubble_labels[(lbl_idx + 1) % len(rubble_labels)]
+
             y_above = (c_top + rwl_n) / 2.0
             y_below = (rwl_n + bot_y) / 2.0
-            ax.text(x_center, y_above, lbl_above, color='red', ha='center', va='center', fontsize=10, fontweight='bold', zorder=5)
-            ax.text(x_center, y_below, lbl_below, color='black', ha='center', va='center', fontsize=10, fontweight='bold', zorder=5)
 
-    top_x_front = tier_geoms[0]['x_front']
-    ax.plot([top_x_front, max_b + 1.5], [c_top, c_top], color='black', linewidth=1.5, zorder=2)
-    
+            ax.text(x_center, y_above, lbl_above, color='red', ha='center', va='center', fontsize=10, fontweight='bold',
+                    zorder=5)
+            ax.text(x_center, y_below, lbl_below, color='black', ha='center', va='center', fontsize=10,
+                    fontweight='bold', zorder=5)
+            lbl_idx += 2
+
+    # 마루 수평선 (DL +4.00)
+    ax.plot([-0.5, max_b + 1.5], [c_top, c_top], color='black', linewidth=1.5, zorder=2)
+
+    # 조위선 표시 (HWL, RWL, LLW)
     ax.axhline(hwl_n, color='#1f77b4', linestyle='--', linewidth=1.5, zorder=1)
     ax.text(max_b + 0.5, hwl_n, f"평상시 HWL ({hwl_n:.3f})", color='#1f77b4', va='bottom', fontsize=9)
+
     ax.axhline(rwl_n, color='#00b0f0', linestyle='-', linewidth=2, zorder=1)
     ax.text(max_b + 0.5, rwl_n, f"평상 잔류수위 ({rwl_n:.3f})", color='#00b0f0', va='bottom', fontsize=9, fontweight='bold')
+
     ax.axhline(llw, color='#0070c0', linestyle=':', linewidth=1.5, zorder=1)
     ax.text(max_b + 0.5, llw, f"L.L.W ({llw:.3f})", color='#0070c0', va='bottom', fontsize=9)
 
+    # 여백 및 비율 설정
     ax.set_xlim(-4.0, max_b + 2.5)
     ax.set_ylim(current_y - 1.5, c_top + 1.2)
     ax.set_title("가) 하중 산정 및 단면 상세 모식도", fontsize=13, fontweight='bold', pad=15)
@@ -321,36 +412,30 @@ def draw_schematic(tiers_df, c_top, hwl_n, rwl_n, llw):
     img_b64 = base64.b64encode(buf.read()).decode('utf-8')
     return f"<div class='fig-container'><img src='data:image/png;base64,{img_b64}' style='max-width:100%; height:auto;'></div>"
 
-# (이후 st.set_page_config 부분 유지)
-
 
 # =====================================================================
 # ★ 4. Streamlit UI
 # =====================================================================
 st.set_page_config(page_title="엑셀 완벽구현 블록식 안벽 구조계산서", layout="wide")
-st.markdown("<h1 style='text-align:center;'>🧱 블록식 안벽 상세 구조계산서(결정론적 설계법)</h1>", unsafe_allow_html=True)
+st.markdown("<h1 style='text-align:center;'>🧱 블록식 안벽 상세 구조계산서</h1>", unsafe_allow_html=True)
 st.caption("※ 케이스별(상재하중 토압/자중 적용 여부) 하중조합 자동 연산 및 상세 출력 지원")
 
-# =====================================================================
-# ★ 홈(Home) 화면에 추가할 4_WB 앱 사용설명서 렌더링 영역 (항만설계기준 참고 박스 반영)
-# =====================================================================
+# 🌟 홈 화면 앱 사용설명서 추가 영역 (지진시 토압 이론 및 적용 배경 포함)
 st.markdown("""
-4. **4_WB**: 블록식 안벽 상세 구조계산서 자동화 및 하중조합(평상시/지진시) 검토 프로그램[cite: 1] 2026.8.13 수정완료(설계사례집 단면 적용)
+15. **15_WB**: 블록식 안벽 상세 구조계산서 자동화 및 하중조합(평상시/지진시) 검토 프로그램[cite: 1]
 """)
 
 with st.expander("👉 블록식 안벽 상세 구조계산서 자동화 시스템 앱 사용설명서 보기"):
     st.markdown(r"""
     **■ 🧱 블록식 안벽 상세 구조계산서 자동화 시스템 사용자 매뉴얼**
 
-    이 프로그램은 항만 및 해안 구조물 중 **블록식 안벽(Block-type Quay Wall)**의 단별 제원과 지반 조건을 입력받아, 평상시 및 지진시의 각종 하중(자중, 토압, 수압, 상재하중, 견인력, 관성력, 동수압)을 자동으로 산정하고 **활동, 전도, 지지력에 대한 안정성 검토**를 수행하는 전문가용 통합 구조계산서 자동화 도구입니다[cite: 1].  
-    항만 설계사레집에 단면 및 설계조건을 동일적용하였으며, 설계사례집에 오류(자중산정시 팔길이 오류, 지진시 토압산정오류, 상재하중 있는경우 관성력 추가 등)를 수정하여 반영함
+    이 프로그램은 항만 및 해안 구조물 중 **블록식 안벽(Block-type Quay Wall)**의 단별 제원과 지반 조건을 입력받아, 평상시 및 지진시의 각종 하중(자중, 토압, 수압, 상재하중, 견인력, 관성력, 동수압)을 자동으로 산정하고 **활동, 전도, 지지력에 대한 안정성 검토**를 수행하는 전문가용 통합 구조계산서 자동화 도구입니다[cite: 1].
 
     ---
 
     ### **Ⅰ. 블록 입력난 제원 상세 설명 (Input Data Guide)**
 
-    좌측 사이드바의 **[블록 단별 규격]** 데이터 에디터(Data Editor)는 구조물의 핵심 단면을 결정하는 공간입니다. 각 열(Column)에 입력되는 항목의 세부 의미와 작성 방법은 다음과 같습니다[cite: 1].  
-    블록 돌출 또는 상치사다리꼴 형상 등 형상이 변하더라도 자중 및 팔길이 모멘트 등이 자동 산정할수 있게 완벽하게 구현함.(혹시 안되는 경우가 있음 저한테 알려주세요) 
+    좌측 사이드바의 **[블록 단별 규격]** 데이터 에디터(Data Editor)는 구조물의 핵심 단면을 결정하는 공간입니다. 각 열(Column)에 입력되는 항목의 세부 의미와 작성 방법은 다음과 같습니다[cite: 1].
 
     * **구분:** 각 단의 명칭을 입력합니다. (예: 상치, 1단, 2단, 3단, 4단, 5단 등)[cite: 1]
     * **높이 H(m):** 해당 블록 단의 수직 높이를 입력합니다. (단위: m)[cite: 1]
@@ -360,7 +445,6 @@ with st.expander("👉 블록식 안벽 상세 구조계산서 자동화 시스�
     * **전면수직고(m):** 최하단 단면 등에서 전면 돌출부의 수직 높이 구간을 입력합니다.[cite: 1]
     * **경사비(1:N):** 단면 하부 또는 마운드 접합부의 경사 비율(1:N)을 입력합니다.[cite: 1]
     * **후단수직고(m):** 최하단 단면의 후면부 수직 높이를 입력하여 복잡한 기하학적 단면 형상을 완벽히 구현합니다[cite: 1].
-    
 
     ---
 
@@ -379,7 +463,7 @@ with st.expander("👉 블록식 안벽 상세 구조계산서 자동화 시스�
 
     ### **Ⅲ. 지진시 토압 산정 이론 및 벽면마찰각($\delta$) 적용 배경**
     """)
-    
+
     st.markdown("""
     <div style="background-color: #e8f0fe; border-left: 5px solid #1a73e8; padding: 12px; margin: 10px 0; font-size: 13px; line-height: 1.6;">
       <b>※ 참고 : 항만설계기준 지진시 토압편</b><br>
@@ -393,7 +477,7 @@ with st.expander("👉 블록식 안벽 상세 구조계산서 자동화 시스�
     * **모노베·오카베(M-O) 이론 배경:** 
       * 지진시 토압은 모노베·오카베가 제안한 이론에 근거하며, M-O 이론($\delta > 0$)은 쿨롬(Coulomb) 토압 이론을 지진시 동적 상황으로 확장한 것으로 벽체와 뒤채움재 사이의 마찰각($\delta$, 통상 $\Phi/2$ 또는 $\pm 15^\circ$ 전후)을 명시적으로 고려합니다.
     * **국내 항만설계기준 적용상의 특징:**
-      * 일본의 경우 랜킨(Rankine)토압을 사용하지 않고 모두 쿨롬토압을 적용하므로 정합성에 문제가 없으나, 국내 항만설계기준의 경우 벽면과 가상배면이 있는 조건(케이슨식 제외)에서 랭킨토압을 적용하도록 되어 있어 평상시는 문제없으나 지진시 모노베·오카베 제안식과의 연계 시 벽면마찰각 고려 여부가 실무적 논란이 될 수 있습니다.
+      * 일본의 경우 랜킨(Rankine)토압을 사용하지 않고 모두 쿨롬토압을 적용하므로 정합성에 문제가 없으나, 국내 항만설계기준의 경우 벽면과 가상배면이 있는 조건(케이스 제외)에서 랭킨토압을 적용하도록 되어 있어 평상시는 문제없으나 지진시 모노베·오카베 제안식과의 연계 시 벽면마찰각 고려 여부가 실무적 논란이 될 수 있습니다.
       * 공식 기준상 지진시는 모노베·오카베 제안식을 사용하여 $\delta = 15^\circ$ 등을 고려해야 하나, 설계기준의 랜킨토압 적용 원칙과 상이한 부분이 발생합니다.
     * **본 프로그램의 적용 방식 (항만시설물 설계사례집 준용):**
       * 『항만시설물 설계사례집(상권)』에 따라 평상시 및 지진시 모두 **벽면마찰각 $\delta = 0$ (랜킨토압 준용)**을 일관되게 적용하였습니다.
@@ -403,24 +487,24 @@ with st.expander("👉 블록식 안벽 상세 구조계산서 자동화 시스�
 st.sidebar.header("📁 해석 모드 및 수위 조건")
 calc_mode = st.sidebar.radio("해석 모드 선택", ["평상시 (Normal)", "지진시 (Earthquake)"], index=0)
 
-hwl_n = st.sidebar.number_input("평상시 H.W.L (m)", value=0.632, format="%.3f", step=0.001)
+hwl_n = st.sidebar.number_input("평상시 H.W.L (m)", value=1.964, format="%.3f", step=0.001)
 llw = st.sidebar.number_input("L.L.W (m)", value=0.000, format="%.3f", step=0.001)
 
 default_rwl = llw + (hwl_n - llw) / 3.0
 rwl_n = st.sidebar.number_input("평상 잔류수위 (m)", value=default_rwl, format="%.3f", step=0.001)
-h_water = st.sidebar.number_input("전면수심 H (m)", value=11.000, format="%.3f", step=0.100)
+h_water = st.sidebar.number_input("전면수심 H (m)", value=12.000, format="%.3f", step=0.100)
 
-c_top = st.sidebar.number_input("마루높이 (부지고, DL.m)", value=2.50, format="%.2f", step=0.01)
+c_top = st.sidebar.number_input("마루높이 (부지고, DL.m)", value=4.00, format="%.2f", step=0.01)
 
 st.sidebar.divider()
 st.sidebar.header("🧱 블록 단별 규격 (무제한 입력)")
 if "tier_data" not in st.session_state:
     st.session_state.tier_data = pd.DataFrame({
         "구분": ["상치", "1단", "2단", "3단", "4단", "5단"],
-        "높이 H(m)": [2.0, 2.0, 2.0, 2.0, 2.0, 2.0],
-        "폭 B(m)": [4.5, 5.0, 6.5, 8.0, 9.5, 11.5],
-        "상단폭(m)": [4.5, 5.0, 6.5, 8.0, 9.5, 10.5],
-        "전면돌출(m)": [0.5, 0.0, 0.0, 0.0, 0.0, 1.0],
+        "높이 H(m)": [2.5, 2.0, 2.0, 2.0, 2.0, 2.0],
+        "폭 B(m)": [3.3, 5.5, 5.5, 6.5, 7.5, 9.5],
+        "상단폭(m)": [3.3, 5.5, 5.5, 6.5, 7.5, 9.5],
+        "전면돌출(m)": [0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
         "전면수직고(m)": [0.0, 0.0, 0.0, 0.0, 0.0, 0.5],
         "경사비(1:N)": [0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
         "후단수직고(m)": [0.0, 0.0, 0.0, 0.0, 0.0, 0.5]
@@ -445,8 +529,8 @@ edited_tiers = st.sidebar.data_editor(
 st.sidebar.divider()
 st.sidebar.header("🌍 지반 및 단위중량 조건")
 phi = st.sidebar.number_input("내부마찰각 Φ (°)", value=40.0)
-delta = st.sidebar.number_input("벽면마찰각 δ (°)", value=0.0)
-kh = st.sidebar.number_input("설계수평지진계수(kh)", value=0.120, format="%.3f")
+delta = st.sidebar.number_input("벽면마찰각 δ (°)", value=15.0)
+kh = st.sidebar.number_input("설계수평지진계수(kh)", value=0.079, format="%.3f")
 # =====================================================================
 # ★ 추가할 코드: 함수 바깥에서 ka_n (평상시 주동토압계수) 미리 정의하기
 # =====================================================================
@@ -459,18 +543,18 @@ g_c_eq = st.sidebar.number_input("무근Con (관성력용)", value=22.6)
 g_s_wet = st.sidebar.number_input("사석 (수상)", value=18.0)
 g_s_sub = st.sidebar.number_input("사석 (수중)", value=10.0)
 g_s_sat = st.sidebar.number_input("사석 (포화, 지진시)", value=20.0)
-g_w = st.sidebar.number_input("해수 단위중량 (kN/m³)", value=10.3, format="%.1f")
+g_w = st.sidebar.number_input("해수 단위중량 (kN/m³)", value=10.1, format="%.1f")
 
 st.sidebar.divider()
 st.sidebar.subheader("설계 하중 및 지지력 조건")
 qa_n = st.sidebar.number_input("사석 허용지지력 (평상시, kPa)", value=500.0, step=10.0)
 qa_s = st.sidebar.number_input("사석 허용지지력 (지진시, kPa)", value=600.0, step=10.0)
 
-q_n = st.sidebar.number_input("평상시 상재하중 (kPa)", value=60.0)
-q_s = st.sidebar.number_input("지진시 상재하중 (kPa)", value=30.0)
-mooring_t = st.sidebar.number_input("계선곡주 견인력 (kN)", value=500.0)
-mooring_interval = st.sidebar.number_input("계선주 설치간격 (m)", value=12.0, format="%.2f")
-mooring_h = st.sidebar.number_input("계선곡주 높이(견인력 작용점, m)", value=0.31, format="%.2f")
+q_n = st.sidebar.number_input("평상시 상재하중 (kPa)", value=20.0)
+q_s = st.sidebar.number_input("지진시 상재하중 (kPa)", value=10.0)
+mooring_t = st.sidebar.number_input("계선곡주 견인력 (kN)", value=350.0)
+mooring_interval = st.sidebar.number_input("계선주 설치간격 (m)", value=15.0, format="%.2f")
+mooring_h = st.sidebar.number_input("계선곡주 높이(견인력 작용점, m)", value=0.40, format="%.2f")
 
 rep = ReportBuilder()
 
@@ -496,7 +580,7 @@ def o_html(h): st.markdown(h, unsafe_allow_html=True); rep.html_raw(h)
 
 
 # =====================================================================
-# ★ 5. 정밀 연산 엔진 (자중표 및 관성력표 1:1 완벽 동기화 버전)
+# ★ 5. 정밀 연산 엔진 (CASE별 하중조합 완벽 분류 및 토압 정밀 적분 적용)
 # =====================================================================
 
 # -------------------------------------------------------------
@@ -625,348 +709,216 @@ ep_nodes_s0 = get_ep_nodes(edited_tiers, rwl_n, c_top, g_s_wet, g_s_sub, True, 0
 ep_nodes_sq = get_ep_nodes(edited_tiers, rwl_n, c_top, g_s_wet, g_s_sub, True, q_s, kh, phi, delta)
 
 # -------------------------------------------------------------
-# 자중 및 관성력 연산 루프 (오리지널 절대 좌표계 완벽 복구 및 공제 자동화)
-# -------------------------------------------------------------
+
+sum_W_n, sum_W_x_n = 0.0, 0.0
+sum_mass_s, sum_mass_y_s = 0.0, 0.0
+prev_b = 0.0
+current_elev = c_top
+
+sum_v_sq_n, sum_mr_sq_n = 0.0, 0.0
+sum_v_sq_s, sum_mr_sq_s = 0.0, 0.0
+prev_b_sq = 0.0
+
 tier_details = []
 html_table_rows = ""
 html_table_rows_inertia = ""
+prev_mass = 0.0
+prev_cg_y_rel = 0.0
 
-valid_tiers = []
+rubble_labels = ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l']
+rubble_lbl_idx = 0
+
+try:
+    top_b = float(edited_tiers.iloc[0]["폭 B(m)"]) if not edited_tiers.empty else 0.0
+except:
+    top_b = 0.0
+
 for idx, row in edited_tiers.iterrows():
     name_val = row.get("구분", None)
     if pd.isna(name_val) or str(name_val).strip().lower() in ["none", "nan", ""]:
         continue
     try:
-        h_val = float(row["높이 H(m)"])
-        b_val = float(row["폭 B(m)"])
-        if pd.isna(h_val) or pd.isna(b_val):
+        h = float(row["높이 H(m)"])
+        b = float(row["폭 B(m)"])
+        if pd.isna(h) or pd.isna(b):
             continue
     except Exception:
         continue
-    valid_tiers.append(row)
 
-total_tiers = len(valid_tiers)
-
-# ★ 1. 절대 좌표계 구축 (각 층별 돌출값으로만 독립적 X좌표 생성. 하향식 누적 완전 폐기)
-x_front = [0.0] * total_tiers
-x_rear = [0.0] * total_tiers
-pivot = [0.0] * total_tiers
-
-for i in range(total_tiers):
-    b_i = float(valid_tiers[i]["폭 B(m)"])
-    out_h_i = float(valid_tiers[i].get("전면돌출(m)", 0.0)) if pd.notna(valid_tiers[i].get("전면돌출(m)")) else 0.0
-    x_front[i] = -out_h_i
-    x_rear[i] = x_front[i] + b_i
-
-# 2. 각 단의 전도 지점(Pivot) 산정
-for i in range(total_tiers):
-    if i < total_tiers - 1:
-        pivot[i] = max(x_front[i], x_front[i+1])
-    else:
-        pivot[i] = x_front[i]
-
-# 팔길이 문자열 직관적 포맷팅 함수
-def get_arm_str(start_x, w, div_str, piv):
-    eff_start = start_x - piv
-    if abs(eff_start) < 0.001: 
-        return f"({w:.2f}/{div_str})"
-    sign = "+" if eff_start > 0 else "-"
-    formatted_start = f"{sign}{abs(eff_start):.2f}" if sign == "-" else f"{abs(eff_start):.2f}"
-    return f"({formatted_start} + {w:.2f}/{div_str})"
-
-global_W_sum = 0.0
-global_W_M_sum = 0.0
-global_mass_sum = 0.0
-global_mass_Y_sum = 0.0
-current_elev = c_top
-
-# ★ 사석 라벨 기호 무한 생성기 (a~z, aa~zz) 및 카운터 설정
-rubble_labels = [chr(i) for i in range(97, 123)] + [chr(i)*2 for i in range(97, 123)]
-rubble_lbl_idx = 0
-
-for idx, row in enumerate(valid_tiers):
-    name = str(row["구분"])
-    h = float(row["높이 H(m)"])
-    b = float(row["폭 B(m)"])
-
-    top_b = float(row.get("상단폭(m)", b)) if pd.notna(row.get("상단폭(m)")) else b
-    out_h = float(row.get("전면돌출(m)", 0.0)) if pd.notna(row.get("전면돌출(m)")) else 0.0
-    toe_v = float(row.get("전면수직고(m)", 0.0)) if pd.notna(row.get("전면수직고(m)")) else 0.0
-    rear_v = float(row.get("후단수직고(m)", 0.0)) if pd.notna(row.get("후단수직고(m)")) else 0.0
-
+    name = str(name_val)
     top_elev = current_elev
     bot_elev = current_elev - h
     z_depth = c_top - bot_elev
-    is_first = (idx == 0)
-    is_last = (idx == total_tiers - 1)
-
-    curr_x_front = x_front[idx]
-    curr_x_rear = x_rear[idx]
-    curr_pivot = pivot[idx]
+    is_last = (idx == len(edited_tiers) - 1)
 
     tier_components = []
     inertia_components = []
 
-    # -----------------------------------------------------------------
-    # 0) 상부 이관 자중
-    # -----------------------------------------------------------------
     if idx > 0:
-        sub_label = "상치자중" if idx == 1 else "상부자중"
-        upper_cg_global = global_W_M_sum / global_W_sum if global_W_sum > 0 else 0.0
-        upper_arm_local = upper_cg_global - curr_pivot
-        upper_mvn = global_W_sum * upper_arm_local
+        tier_components.append({"sub": "상치자중" if idx == 1 else "상부자중", "basis_n": "-", "vn": sum_W_n,
+                                "xn": sum_W_x_n / sum_W_n if sum_W_n > 0 else 0, "mvn": sum_W_x_n})
+        inertia_components.append({"sub": "from", "basis": "이전 단 누적", "mass": prev_mass, "arm": prev_cg_y_rel + h,
+                                   "mh": prev_mass * (prev_cg_y_rel + h)})
 
-        eff_cg = upper_cg_global - curr_pivot
-        if abs(eff_cg) < 0.001: arm_basis_str = f"({upper_cg_global:.2f})"
-        else: arm_basis_str = f"({eff_cg:.2f})"
+    h_above = max(0, top_elev - max(bot_elev, rwl_n))
+    h_below = max(0, min(top_elev, rwl_n) - bot_elev)
 
-        tier_components.append({
-            "sub": sub_label, "basis_n": f"W={global_W_sum:.2f}",
-            "arm_basis": arm_basis_str, "vn": global_W_sum, "xn": upper_arm_local, "mvn": upper_mvn
-        })
+    if h_above > 0:
+        v_n = b * h_above * g_c_wet
+        m_s = b * h_above * g_c_eq
+        x = b / 2.0
+        mv_n = v_n * x
+        y_cm = top_elev - h_above / 2.0
+        sum_W_n += v_n;
+        sum_W_x_n += mv_n
+        sum_mass_s += m_s;
+        sum_mass_y_s += m_s * y_cm
+        tier_components.append(
+            {"sub": "Con수상", "basis_n": f"{b:.2f} × {h_above:.2f} × 1 × {g_c_wet:.1f}", "vn": v_n, "xn": x,
+             "mvn": mv_n})
+        inertia_components.append({"sub": "Con수상", "basis": f"{b:.2f} × {h_above:.2f} × 1 × {g_c_eq:.1f}", "mass": m_s,
+                                   "arm": y_cm - bot_elev, "mh": m_s * (y_cm - bot_elev)})
 
-        upper_mass_cg_Y = global_mass_Y_sum / global_mass_sum if global_mass_sum > 0 else 0.0
-        arm_y_from = upper_mass_cg_Y - bot_elev
-        mh_from = global_mass_sum * arm_y_from
+    if h_below > 0:
+        v_n = b * h_below * g_c_sub
+        m_s = b * h_below * g_c_eq
+        x = b / 2.0
+        mv_n = v_n * x
+        y_cm = bot_elev + h_below / 2.0
+        sum_W_n += v_n;
+        sum_W_x_n += mv_n
+        sum_mass_s += m_s;
+        sum_mass_y_s += m_s * y_cm
+        tier_components.append(
+            {"sub": "Con수중", "basis_n": f"{b:.2f} × {h_below:.2f} × 1 × {g_c_sub:.1f}", "vn": v_n, "xn": x,
+             "mvn": mv_n})
+        inertia_components.append({"sub": "Con수중", "basis": f"{b:.2f} × {h_below:.2f} × 1 × {g_c_eq:.1f}", "mass": m_s,
+                                   "arm": y_cm - bot_elev, "mh": m_s * (y_cm - bot_elev)})
 
-        inertia_components.append({
-            "sub": sub_label, "basis": f"W={global_mass_sum:.2f}",
-            "mass": global_mass_sum, "arm": arm_y_from, "mh": mh_from
-        })
+    if is_last:
+        v_n_rect = 1.0 * 0.5 * 1.0 * (-g_c_sub)
+        m_s_rect = 1.0 * 0.5 * 1.0 * (-g_c_eq)
+        x_rect = 1.0 / 2.0
+        mv_n_rect = v_n_rect * x_rect
+        y_cm_rect = top_elev - 0.25
+        sum_W_n += v_n_rect;
+        sum_W_x_n += mv_n_rect
+        sum_mass_s += m_s_rect;
+        sum_mass_y_s += m_s_rect * y_cm_rect
+        tier_components.append(
+            {"sub": "Con공제", "basis_n": f"1.00 × 0.50 × 1 × -{g_c_sub:.2f}", "vn": v_n_rect, "xn": x_rect,
+             "mvn": mv_n_rect})
+        inertia_components.append(
+            {"sub": "Con공제", "basis": f"1.00 × 0.50 × 1 × -{g_c_eq:.2f}", "mass": m_s_rect, "arm": y_cm_rect - bot_elev,
+             "mh": m_s_rect * (y_cm_rect - bot_elev)})
 
-    h_above = max(0.0, top_elev - max(bot_elev, rwl_n))
-    h_below = max(0.0, min(top_elev, rwl_n) - bot_elev)
+        v_n_tri = 1.0 * 1.0 * 0.5 * (-g_c_sub)
+        m_s_tri = 1.0 * 1.0 * 0.5 * (-g_c_eq)
+        x_tri = 1.0 / 3.0
+        mv_n_tri = v_n_tri * x_tri
+        y_cm_tri = top_elev - 0.5 - (1.0 / 3.0)
+        sum_W_n += v_n_tri;
+        sum_W_x_n += mv_n_tri
+        sum_mass_s += m_s_tri;
+        sum_mass_y_s += m_s_tri * y_cm_tri
+        tier_components.append(
+            {"sub": "Con공제", "basis_n": f"1.00 × 1.00 × 1/2 × -{g_c_sub:.2f}", "vn": v_n_tri, "xn": x_tri,
+             "mvn": mv_n_tri})
+        inertia_components.append(
+            {"sub": "Con공제", "basis": f"1.00 × 1.00 × 1/2 × -{g_c_eq:.2f}", "mass": m_s_tri, "arm": y_cm_tri - bot_elev,
+             "mh": m_s_tri * (y_cm_tri - bot_elev)})
 
-    # -----------------------------------------------------------------
-    # 1) 제체 콘크리트 및 가상배면 사석 연산
-    # -----------------------------------------------------------------
-    if is_first:
-        w_rect = min(top_b, b)
-        w_tri = abs(b - top_b)
-
-        x_cg_rect = curr_x_front + w_rect / 2.0
-        arm_rect = x_cg_rect - curr_pivot
-        rect_arm_str = get_arm_str(curr_x_front, w_rect, "2", curr_pivot)
-
-        x_cg_tri = (curr_x_front + w_rect + w_tri / 3.0) if b > top_b else (curr_x_front + w_tri * 2.0 / 3.0)
-        arm_tri = x_cg_tri - curr_pivot
-        eff_start_tri = (curr_x_front + w_rect) - curr_pivot if b > top_b else curr_x_front - curr_pivot
-        
-        if b > top_b:
-            tri_arm_str = f"({eff_start_tri:.2f} + {w_tri:.2f}/3)" if abs(eff_start_tri) > 0.001 else f"({w_tri:.2f}/3)"
-        else:
-            tri_arm_str = f"({eff_start_tri:.2f} + {w_tri:.2f}*2/3)" if abs(eff_start_tri) > 0.001 else f"({w_tri:.2f}*2/3)"
-
-        if h_above > 0:
-            v_n = w_rect * h_above * g_c_wet
-            tier_components.append({"sub": "Con수상", "basis_n": f"W:{w_rect:.2f}×{h_above:.2f}×{g_c_wet:.1f}", "arm_basis": rect_arm_str, "vn": v_n, "xn": arm_rect, "mvn": v_n * arm_rect})
-            global_W_sum += v_n; global_W_M_sum += v_n * x_cg_rect
-            m_s = w_rect * h_above * g_c_eq
-            y_arm = h_below + (h_above / 2.0)
-            inertia_components.append({"sub": "Con수상", "basis": f"{w_rect:.2f} × {h_above:.2f} × 1 × {g_c_eq:.1f}", "mass": m_s, "arm": y_arm, "mh": m_s * y_arm})
-            global_mass_sum += m_s; global_mass_Y_sum += m_s * (bot_elev + y_arm)
-
-        if h_below > 0:
-            v_n = w_rect * h_below * g_c_sub
-            tier_components.append({"sub": "Con수중", "basis_n": f"W:{w_rect:.2f}×{h_below:.2f}×{g_c_sub:.1f}", "arm_basis": rect_arm_str, "vn": v_n, "xn": arm_rect, "mvn": v_n * arm_rect})
-            global_W_sum += v_n; global_W_M_sum += v_n * x_cg_rect
-            m_s = w_rect * h_below * g_c_eq
-            y_arm = h_below / 2.0
-            inertia_components.append({"sub": "Con수중", "basis": f"{w_rect:.2f} × {h_below:.2f} × 1 × {g_c_eq:.1f}", "mass": m_s, "arm": y_arm, "mh": m_s * y_arm})
-            global_mass_sum += m_s; global_mass_Y_sum += m_s * (bot_elev + y_arm)
-
-        if w_tri > 0.001:
-            if h_above > 0:
-                v_n = 0.5 * w_tri * h_above * g_c_wet
-                tier_components.append({"sub": "Con수상(경사)", "basis_n": f"W:0.5×{w_tri:.2f}×{h_above:.2f}×{g_c_wet:.1f}", "arm_basis": tri_arm_str, "vn": v_n, "xn": arm_tri, "mvn": v_n * arm_tri})
-                global_W_sum += v_n; global_W_M_sum += v_n * x_cg_tri
-                m_s = 0.5 * w_tri * h_above * g_c_eq
-                y_arm = h_below + (h_above / 3.0)
-                inertia_components.append({"sub": "Con수상(경사)", "basis": f"{w_tri:.2f} × {h_above:.2f} × 0.5 × {g_c_eq:.1f}", "mass": m_s, "arm": y_arm, "mh": m_s * y_arm})
-                global_mass_sum += m_s; global_mass_Y_sum += m_s * (bot_elev + y_arm)
-
-            if h_below > 0:
-                v_n = 0.5 * w_tri * h_below * g_c_sub
-                tier_components.append({"sub": "Con수중(경사)", "basis_n": f"W:0.5×{w_tri:.2f}×{h_below:.2f}×{g_c_sub:.1f}", "arm_basis": tri_arm_str, "vn": v_n, "xn": arm_tri, "mvn": v_n * arm_tri})
-                global_W_sum += v_n; global_W_M_sum += v_n * x_cg_tri
-                m_s = 0.5 * w_tri * h_below * g_c_eq
-                y_arm = h_below / 3.0
-                inertia_components.append({"sub": "Con수중(경사)", "basis": f"{w_tri:.2f} × {h_below:.2f} × 0.5 × {g_c_eq:.1f}", "mass": m_s, "arm": y_arm, "mh": m_s * y_arm})
-                global_mass_sum += m_s; global_mass_Y_sum += m_s * (bot_elev + y_arm)
-
-        if b > top_b:
-            w_soil = b - top_b
-            x_cg_soil = curr_x_front + top_b + w_soil * (2.0 / 3.0)
-            arm_soil = x_cg_soil - curr_pivot
-            eff_soil_start = (curr_x_front + top_b) - curr_pivot
-            
-            if abs(eff_soil_start) < 0.001: soil_arm_str = f"({w_soil:.2f}*2/3)"
-            else:
-                sign = "+" if eff_soil_start > 0 else "-"
-                formatted_start = f"{sign}{abs(eff_soil_start):.2f}" if sign == "-" else f"{abs(eff_soil_start):.2f}"
-                soil_arm_str = f"({formatted_start} + {w_soil:.2f}*2/3)"
-
-            if h_above > 0:
-                v_soil = 0.5 * w_soil * h_above * g_s_wet
-                tier_components.append({"sub": "사석수상(a')", "basis_n": f"W:0.5×{w_soil:.2f}×{h_above:.2f}×{g_s_wet:.1f}", "arm_basis": soil_arm_str, "vn": v_soil, "xn": arm_soil, "mvn": v_soil * arm_soil})
-                global_W_sum += v_soil; global_W_M_sum += v_soil * x_cg_soil
-                m_soil = 0.5 * w_soil * h_above * g_s_wet
-                y_arm = h_below + (h_above / 3.0)
-                inertia_components.append({"sub": "사석수상(a')", "basis": f"0.50 × {w_soil:.2f} × {h_above:.2f} × 1 × {g_s_wet:.1f}", "mass": m_soil, "arm": y_arm, "mh": m_soil * y_arm})
-                global_mass_sum += m_soil; global_mass_Y_sum += m_soil * (bot_elev + y_arm)
-
-            if h_below > 0:
-                v_soil_sub = 0.5 * w_soil * h_below * g_s_sub
-                tier_components.append({"sub": "사석수중(a')", "basis_n": f"W:0.5×{w_soil:.2f}×{h_below:.2f}×{g_s_sub:.1f}", "arm_basis": soil_arm_str, "vn": v_soil_sub, "xn": arm_soil, "mvn": v_soil_sub * arm_soil})
-                global_W_sum += v_soil_sub; global_W_M_sum += v_soil_sub * x_cg_soil
-                m_soil_sub = 0.5 * w_soil * h_below * g_s_sat
-                y_arm = h_below / 3.0
-                inertia_components.append({"sub": "사석수중(a')", "basis": f"0.50 × {w_soil:.2f} × {h_below:.2f} × 1 × {g_s_sat:.1f}", "mass": m_soil_sub, "arm": y_arm, "mh": m_soil_sub * y_arm})
-                global_mass_sum += m_soil_sub; global_mass_Y_sum += m_soil_sub * (bot_elev + y_arm)
-
-    else:
-        x_cg_rect = curr_x_front + b / 2.0
-        arm_rect = x_cg_rect - curr_pivot
-        rect_arm_str = get_arm_str(curr_x_front, b, "2", curr_pivot)
-
-        if h_above > 0:
-            v_n = b * h_above * g_c_wet
-            tier_components.append({"sub": "Con수상", "basis_n": f"W:{b:.2f}×{h_above:.2f}×{g_c_wet:.1f}", "arm_basis": rect_arm_str, "vn": v_n, "xn": arm_rect, "mvn": v_n * arm_rect})
-            global_W_sum += v_n; global_W_M_sum += v_n * x_cg_rect
-            m_s = b * h_above * g_c_eq
-            y_arm = h_below + (h_above / 2.0)
-            inertia_components.append({"sub": "Con수상", "basis": f"{b:.2f} × {h_above:.2f} × 1 × {g_c_eq:.1f}", "mass": m_s, "arm": y_arm, "mh": m_s * y_arm})
-            global_mass_sum += m_s; global_mass_Y_sum += m_s * (bot_elev + y_arm)
-
-        if h_below > 0:
-            v_n = b * h_below * g_c_sub
-            tier_components.append({"sub": "Con수중", "basis_n": f"W:{b:.2f}×{h_below:.2f}×{g_c_sub:.1f}", "arm_basis": rect_arm_str, "vn": v_n, "xn": arm_rect, "mvn": v_n * arm_rect})
-            global_W_sum += v_n; global_W_M_sum += v_n * x_cg_rect
-            m_s = b * h_below * g_c_eq
-            y_arm = h_below / 2.0
-            inertia_components.append({"sub": "Con수중", "basis": f"{b:.2f} × {h_below:.2f} × 1 × {g_c_eq:.1f}", "mass": m_s, "arm": y_arm, "mh": m_s * y_arm})
-            global_mass_sum += m_s; global_mass_Y_sum += m_s * (bot_elev + y_arm)
-
-        # ★ 최하단(5단 등) 발가락 공제 자동 연산 (후단수직고=0 이면 직사는 자동 생략, 경사만 산출!)
-        if is_last and out_h > 0:
-            h_rect = rear_v
-            h_cut = max(0.0, h - toe_v - h_rect)
-            
-            if h_rect > 0.001:
-                x_cg_cut_rect = curr_x_front + out_h / 2.0
-                arm_cut_rect = x_cg_cut_rect - curr_pivot
-                rect_arm_str_t = get_arm_str(curr_x_front, out_h, "2", curr_pivot)
-                
-                v_n_rect = out_h * h_rect * (-g_c_sub)
-                tier_components.append({"sub": "Con공제(직사)", "basis_n": f"W:{out_h:.2f}×{h_rect:.2f}×{-g_c_sub:.2f}", "arm_basis": rect_arm_str_t, "vn": v_n_rect, "xn": arm_cut_rect, "mvn": v_n_rect * arm_cut_rect})
-                global_W_sum += v_n_rect; global_W_M_sum += v_n_rect * x_cg_cut_rect
-                
-                m_s_rect = out_h * h_rect * (-g_c_eq)
-                y_arm_rect = h_rect / 2.0
-                inertia_components.append({"sub": "Con공제(직사)", "basis": f"{out_h:.2f} × {h_rect:.2f} × -{g_c_eq:.2f}", "mass": m_s_rect, "arm": y_arm_rect, "mh": m_s_rect * y_arm_rect})
-                global_mass_sum += m_s_rect; global_mass_Y_sum += m_s_rect * (bot_elev + y_arm_rect)
-
-            if h_cut > 0.001:
-                x_cg_cut_tri = curr_x_front + out_h * (1.0 / 3.0)
-                arm_cut_tri = x_cg_cut_tri - curr_pivot
-                eff_start_cut_tri = curr_x_front - curr_pivot
-                if abs(eff_start_cut_tri) < 0.001: tri_arm_str_t = f"({out_h:.2f}/3)"
-                else:
-                    sign = "+" if eff_start_cut_tri > 0 else "-"
-                    formatted_start = f"{sign}{abs(eff_start_cut_tri):.2f}" if sign == "-" else f"{abs(eff_start_cut_tri):.2f}"
-                    tri_arm_str_t = f"({formatted_start} + {out_h:.2f}/3)"
-                
-                v_n_tri = 0.5 * out_h * h_cut * (-g_c_sub)
-                tier_components.append({"sub": "Con공제(경사)", "basis_n": f"W:0.5×{out_h:.2f}×{h_cut:.2f}×{-g_c_sub:.2f}", "arm_basis": tri_arm_str_t, "vn": v_n_tri, "xn": arm_cut_tri, "mvn": v_n_tri * arm_cut_tri})
-                global_W_sum += v_n_tri; global_W_M_sum += v_n_tri * x_cg_cut_tri
-                
-                m_s_tri = 0.5 * out_h * h_cut * (-g_c_eq)
-                y_arm_tri = h_rect + h_cut / 3.0
-                inertia_components.append({"sub": "Con공제(경사)", "basis": f"{out_h:.2f} × {h_cut:.2f} × 0.5 × -{g_c_eq:.2f}", "mass": m_s_tri, "arm": y_arm_tri, "mh": m_s_tri * y_arm_tri})
-                global_mass_sum += m_s_tri; global_mass_Y_sum += m_s_tri * (bot_elev + y_arm_tri)
-
-    # -----------------------------------------------------------------
-    # 2) 배면 사석 연산 (폭 자동 산출 및 무한 기호 동기화)
-    # -----------------------------------------------------------------
     if idx > 0:
-        prev_x_rear_val = x_rear[idx-1]
-        w_rubble = max(0.0, curr_x_rear - prev_x_rear_val)
-        
-        if w_rubble > 0.001:
-            x_cg_r = prev_x_rear_val + w_rubble / 2.0
-            arm_r = x_cg_r - curr_pivot
-            rubble_arm_str = get_arm_str(prev_x_rear_val, w_rubble, "2", curr_pivot)
+        db = max(0, b - prev_b - (1.0 if is_last else 0.0))
+        if db > 0:
+            s_above = max(0, c_top - max(top_elev, rwl_n))
+            s_below = max(0, min(c_top, rwl_n) - top_elev)
 
-            r_above = max(0.0, c_top - max(top_elev, rwl_n))
-            r_sub = max(0.0, min(c_top, rwl_n) - top_elev)
-            y_base_above = max(top_elev, rwl_n) - bot_elev
-            y_base_sub = top_elev - bot_elev
+            if s_above > 0 or s_below > 0:
+                x = prev_b + db / 2.0
+                lbl_above_str = ""
+                lbl_below_str = ""
 
-            if r_above > 0.001:
-                lbl_above = rubble_labels[rubble_lbl_idx]
-                rubble_lbl_idx += 1
-                v_r = w_rubble * r_above * g_s_wet
-                tier_components.append({"sub": f"사석수상({lbl_above})", "basis_n": f"W:{w_rubble:.2f}×{r_above:.2f}×{g_s_wet:.1f}", "arm_basis": rubble_arm_str, "vn": v_r, "xn": arm_r, "mvn": v_r * arm_r})
-                global_W_sum += v_r; global_W_M_sum += v_r * x_cg_r
-                m_r = w_rubble * r_above * g_s_wet
-                y_arm_above = y_base_above + (r_above / 2.0)
-                inertia_components.append({"sub": f"사석수상({lbl_above})", "basis": f"{w_rubble:.2f} × {r_above:.2f} × 1 × {g_s_wet:.1f}", "mass": m_r, "arm": y_arm_above, "mh": m_r * y_arm_above})
-                global_mass_sum += m_r; global_mass_Y_sum += m_r * (bot_elev + y_arm_above)
+                if c_top > rwl_n > top_elev:
+                    lbl_above_str = rubble_labels[rubble_lbl_idx % len(rubble_labels)]
+                    lbl_below_str = rubble_labels[(rubble_lbl_idx + 1) % len(rubble_labels)]
+                    rubble_lbl_idx += 2
+                elif top_elev >= rwl_n:
+                    lbl_above_str = rubble_labels[rubble_lbl_idx % len(rubble_labels)]
+                    rubble_lbl_idx += 1
+                elif c_top <= rwl_n:
+                    lbl_below_str = rubble_labels[rubble_lbl_idx % len(rubble_labels)]
+                    rubble_lbl_idx += 1
 
-            if r_sub > 0.001:
-                lbl_sub = rubble_labels[rubble_lbl_idx]
-                rubble_lbl_idx += 1
-                v_r_sub = w_rubble * r_sub * g_s_sub
-                tier_components.append({"sub": f"사석수중({lbl_sub})", "basis_n": f"W:{w_rubble:.2f}×{r_sub:.2f}×{g_s_sub:.1f}", "arm_basis": rubble_arm_str, "vn": v_r_sub, "xn": arm_r, "mvn": v_r_sub * arm_r})
-                global_W_sum += v_r_sub; global_W_M_sum += v_r_sub * x_cg_r
-                m_r_sub = w_rubble * r_sub * g_s_sat
-                y_arm_sub = y_base_sub + (r_sub / 2.0)
-                inertia_components.append({"sub": f"사석수중({lbl_sub})", "basis": f"{w_rubble:.2f} × {r_sub:.2f} × 1 × {g_s_sat:.1f}", "mass": m_r_sub, "arm": y_arm_sub, "mh": m_r_sub * y_arm_sub})
-                global_mass_sum += m_r_sub; global_mass_Y_sum += m_r_sub * (bot_elev + y_arm_sub)
+                if s_above > 0:
+                    v_n = db * s_above * g_s_wet
+                    m_s = db * s_above * g_s_wet
+                    mv_n = v_n * x
+                    y_cm = c_top - s_above / 2.0
+                    sum_W_n += v_n;
+                    sum_W_x_n += mv_n
+                    sum_mass_s += m_s;
+                    sum_mass_y_s += m_s * y_cm
+                    tier_components.append(
+                        {"sub": f"사석수상({lbl_above_str})", "basis_n": f"{db:.2f} × {s_above:.2f} × 1 × {g_s_wet:.1f}",
+                         "vn": v_n, "xn": x, "mvn": mv_n})
+                    inertia_components.append(
+                        {"sub": f"사석수상({lbl_above_str})", "basis": f"{db:.2f} × {s_above:.2f} × 1 × {g_s_wet:.1f}",
+                         "mass": m_s, "arm": y_cm - bot_elev, "mh": m_s * (y_cm - bot_elev)})
 
-    # -----------------------------------------------------------------
-    # HTML 표 렌더링 및 누적 합계 처리
-    # -----------------------------------------------------------------
+                if s_below > 0:
+                    v_n = db * s_below * g_s_sub
+                    m_s = db * s_below * g_s_sat
+                    mv_n = v_n * x
+                    y_cm = top_elev + s_below / 2.0
+                    sum_W_n += v_n;
+                    sum_W_x_n += mv_n
+                    sum_mass_s += m_s;
+                    sum_mass_y_s += m_s * y_cm
+                    tier_components.append(
+                        {"sub": f"사석수중({lbl_below_str})", "basis_n": f"{db:.2f} × {s_below:.2f} × 1 × {g_s_sub:.1f}",
+                         "vn": v_n, "xn": x, "mvn": mv_n})
+                    inertia_components.append(
+                        {"sub": f"사석수중({lbl_below_str})", "basis": f"{db:.2f} × {s_below:.2f} × 1 × {g_s_sat:.1f}",
+                         "mass": m_s, "arm": y_cm - bot_elev, "mh": m_s * (y_cm - bot_elev)})
+
+    xn_total = sum_W_x_n / sum_W_n if sum_W_n > 0 else 0
     rowspan = len(tier_components) + 1
     html_table_rows += f"<tr><td rowspan='{rowspan}' style='border: 1px solid #ccc; background:#fff; vertical-align:middle; text-align:center;'><b>[{name}]</b><br>DL {top_elev:.2f} ~ {bot_elev:.2f}</td>"
-
     for i, comp in enumerate(tier_components):
         if i > 0: html_table_rows += "<tr>"
-        basis_str = str(comp.get('basis_n', ''))
-        arm_str = str(comp.get('arm_basis', ''))
-        arm_cell_content = f"<div style='font-size:11px; color:#7f8c8d; margin-bottom:3px;'>{arm_str}</div><b>{comp['xn']:.2f}</b>" if arm_str else f"<b>{comp['xn']:.2f}</b>"
-        html_table_rows += f"<td style='border: 1px solid #ccc; padding:6px; text-align:center;'>{comp['sub']}</td><td style='border: 1px solid #ccc; padding:6px; text-align:right;'><div style='font-size:11px; color:#7f8c8d; margin-bottom:3px;'>{basis_str}</div><b>{comp['vn']:.2f}</b></td><td style='border: 1px solid #ccc; padding:6px; text-align:right;'>{arm_cell_content}</td><td style='border: 1px solid #ccc; padding:6px; text-align:right; font-weight:bold;'>{comp['mvn']:.2f}</td></tr>\n"
+        html_table_rows += f"<td style='border: 1px solid #ccc; padding:6px; text-align:center;'>{comp['sub']}</td><td style='border: 1px solid #ccc; padding:6px; text-align:right;'><div style='font-size:11px; color:#7f8c8d; margin-bottom:3px;'>{comp['basis_n']}</div><b>{comp['vn']:.2f}</b></td><td style='border: 1px solid #ccc; padding:6px; text-align:right;'>{comp['xn']:.2f}</td><td style='border: 1px solid #ccc; padding:6px; text-align:right; font-weight:bold;'>{comp['mvn']:.2f}</td></tr>\n"
+    html_table_rows += f"<tr style='background:#fdf2e9; font-weight:bold;'><td style='border: 1px solid #ccc; padding:6px; text-align:center;'>합 계</td><td style='border: 1px solid #ccc; padding:6px; text-align:right;'>{sum_W_n:.2f}</td><td style='border: 1px solid #ccc; padding:6px; text-align:right;'>{xn_total:.2f}</td><td style='border: 1px solid #ccc; padding:6px; text-align:right; color:#e67e22;'>{sum_W_x_n:.2f}</td></tr>\n"
 
-    tier_v_sum = sum(comp['vn'] for comp in tier_components)
-    tier_mvn_sum = sum(comp['mvn'] for comp in tier_components)
-    tier_xn_avg = tier_mvn_sum / tier_v_sum if tier_v_sum != 0 else 0.0
-    html_table_rows += f"<tr style='background:#fdf2e9; font-weight:bold;'><td style='border: 1px solid #ccc; padding:6px; text-align:center;'>합 계</td><td style='border: 1px solid #ccc; padding:6px; text-align:right;'>{tier_v_sum:.2f}</td><td style='border: 1px solid #ccc; padding:6px; text-align:right;'>{tier_xn_avg:.2f}</td><td style='border: 1px solid #ccc; padding:6px; text-align:right; color:#e67e22;'>{tier_mvn_sum:.2f}</td></tr>\n"
-
+    sum_m_s = sum(comp["mass"] for comp in inertia_components)
+    sum_mh = sum(comp["mh"] for comp in inertia_components)
+    prev_cg_y_rel = sum_mh / sum_m_s if sum_m_s > 0 else 0
+    prev_mass = sum_m_s
     rowspan_in = len(inertia_components) + 1
     html_table_rows_inertia += f"<tr><td rowspan='{rowspan_in}' style='border: 1px solid #ccc; background:#fff; vertical-align:middle; text-align:center;'><b>[{name}]</b><br>DL {top_elev:.2f} ~ {bot_elev:.2f}</td>"
-    tier_mass_sum = 0.0; tier_mh_sum = 0.0
     for i, comp in enumerate(inertia_components):
-        tier_mass_sum += comp['mass']; tier_mh_sum += comp['mh']
         if i > 0: html_table_rows_inertia += "<tr>"
         html_table_rows_inertia += f"<td style='border: 1px solid #ccc; padding:6px; text-align:center;'>{comp['sub']}</td><td style='border: 1px solid #ccc; padding:6px; text-align:right;'><div style='font-size:11px; color:#7f8c8d; margin-bottom:3px;'>{comp['basis']}</div><b>{comp['mass']:.2f}</b></td><td style='border: 1px solid #ccc; padding:6px; text-align:right;'>{comp['arm']:.2f}</td><td style='border: 1px solid #ccc; padding:6px; text-align:right; color:#1a73e8; font-weight:bold;'>{comp['mh']:.2f}</td></tr>\n"
-    tier_mass_avg = tier_mh_sum / tier_mass_sum if tier_mass_sum > 0 else 0.0
-    html_table_rows_inertia += f"<tr style='background:#e8f0fe; font-weight:bold;'><td style='border: 1px solid #ccc; padding:6px; text-align:center;'>계</td><td style='border: 1px solid #ccc; padding:6px; text-align:right;'>{tier_mass_sum:.2f}</td><td style='border: 1px solid #ccc; padding:6px; text-align:right;'>{tier_mass_avg:.2f}</td><td style='border: 1px solid #ccc; padding:6px; text-align:right; color:#1a73e8;'>{tier_mh_sum:.2f}</td></tr>\n"
+    html_table_rows_inertia += f"<tr style='background:#e8f0fe; font-weight:bold;'><td style='border: 1px solid #ccc; padding:6px; text-align:center;'>계</td><td style='border: 1px solid #ccc; padding:6px; text-align:right;'>{sum_m_s:.2f}</td><td style='border: 1px solid #ccc; padding:6px; text-align:right;'>{prev_cg_y_rel:.2f}</td><td style='border: 1px solid #ccc; padding:6px; text-align:right; color:#1a73e8;'>{sum_mh:.2f}</td></tr>\n"
 
-    # -----------------------------------------------------------------
-    # 하중 및 모멘트 산정
-    # -----------------------------------------------------------------
     hw = max(0, rwl_n - llw)
     h_tri_total = max(0, rwl_n - max(llw, bot_elev))
     h_rect_total = max(0, llw - bot_elev) if rwl_n > llw else 0
     max_p = g_w * (rwl_n - llw) if rwl_n > llw else 0
+
     pw_tri = 0.5 * max_p * h_tri_total if h_tri_total > 0 else 0
     arm_tri = (h_tri_total / 3.0) + h_rect_total
+
     pw_rect = max_p * h_rect_total
     arm_rect = h_rect_total / 2.0
+
     pw_n = pw_tri + pw_rect
     mw_n = (pw_tri * arm_tri) + (pw_rect * arm_rect)
-    u_n = 0.0; mu_n = 0.0
 
+    u_n = 0.0;
+    mu_n = 0.0
+
+    # ★ 수정됨: 단일 삼각형 공식이 아닌, 산출표와 100% 동일한 사전계산 노드를 활용하여 정밀 적분 수행
     ph0_n, mh0_n = integrate_ep(ep_nodes_n0, bot_elev)
     phq_n, mhq_n = integrate_ep(ep_nodes_nq, bot_elev)
     ph0_s, mh0_s = integrate_ep(ep_nodes_s0, bot_elev)
@@ -976,8 +928,9 @@ for idx, row in enumerate(valid_tiers):
     tr_arm = (c_top + mooring_h) - bot_elev
     tr_m = tr_f * tr_arm
 
-    eq_f = tier_mass_sum * kh
-    eq_m = eq_f * tier_mass_avg
+    eq_f = sum_mass_s * kh
+    cg_y = sum_mass_y_s / sum_mass_s if sum_mass_s > 0 else bot_elev
+    eq_m = eq_f * max(0, cg_y - bot_elev)
 
     y_val_dw = max(0.0, llw - bot_elev)
     dw_f = (7.0 / 12.0) * kh * g_w * math.sqrt(h_water) * (y_val_dw ** 1.5) if y_val_dw > 0 else 0.0
@@ -985,42 +938,52 @@ for idx, row in enumerate(valid_tiers):
     hd_from_bot = y_val_dw - hd_from_top if y_val_dw > 0 else 0.0
     dw_m = dw_f * hd_from_bot
 
-    eff_b = (b - out_h) if is_last else b
-    x_cg_sq = curr_x_front + out_h + (eff_b / 2.0) if is_last else curr_x_front + (eff_b / 2.0)
-    arm_sq = x_cg_sq - curr_pivot
+    # ★ 상재하중(연직력 및 모멘트) 단별 산정
+    is_last_tier = (idx == len(edited_tiers) - 1)
+    eff_b = (b - 1.0) if is_last_tier else b
+    arm_sq = 1.0 + (eff_b / 2.0) if is_last_tier else (eff_b / 2.0)
 
     curr_v_sq_n = q_n * eff_b
     curr_mr_sq_n = curr_v_sq_n * arm_sq
+
     curr_v_sq_s = q_s * eff_b
     curr_mr_sq_s = curr_v_sq_s * arm_sq
     v_sq_tier_s = curr_v_sq_s
 
+    # ★ 지진시 상재하중 관성력(제체 위 상재하중 질량 X kh)
     eq_f_sq = curr_v_sq_s * kh
     eq_m_sq = eq_f_sq * (c_top - bot_elev)
 
     tier_details.append({
-        "name": name, "bot_el": bot_elev, "b": b, "z": z_depth, "hw": hw, "out_h": out_h, "is_last": is_last,
+        "name": name, "bot_el": bot_elev, "b": b, "z": z_depth, "hw": hw,
         "pw_n": pw_n, "mw_n": mw_n, "u_n": u_n, "mu_n": mu_n,
         "v_sq_n": curr_v_sq_n, "mr_sq_n": curr_mr_sq_n, "v_sq_s": curr_v_sq_s,
         "v_sq_tier_s": v_sq_tier_s, "mr_sq_s": curr_mr_sq_s, "tr_f": tr_f,
-        "tr_m": tr_m, "dw_f": dw_f, "dw_m": dw_m, 
-        "sum_W_n": global_W_sum, "sum_W_x_n": global_W_M_sum, 
-        "inertia_mass": tier_mass_sum, "inertia_arm": tier_mass_avg,
+        "tr_m": tr_m, "dw_f": dw_f, "dw_m": dw_m, "sum_W_n": sum_W_n,
+        "sum_W_x_n": sum_W_x_n, "inertia_mass": sum_m_s, "inertia_arm": prev_cg_y_rel,
         "ph0_n": ph0_n, "mh0_n": mh0_n, "phq_n": phq_n, "mhq_n": mhq_n,
+
         "eq_f": eq_f, "eq_m": eq_m, "eq_f_sq": eq_f_sq, "eq_m_sq": eq_m_sq,
 
-        "V_1_1": global_W_sum - u_n, "H_1_1": ph0_n + pw_n + tr_f, "Mr_1_1": global_W_M_sum + mu_n, "Mo_1_1": mh0_n + mw_n + tr_m,
-        "V_1_2": global_W_sum - u_n, "H_1_2": phq_n + pw_n + tr_f, "Mr_1_2": global_W_M_sum + mu_n, "Mo_1_2": mhq_n + mw_n + tr_m,
-        "V_1_3": global_W_sum + curr_v_sq_n - u_n, "H_1_3": ph0_n + pw_n + tr_f, "Mr_1_3": global_W_M_sum + curr_mr_sq_n + mu_n, "Mo_1_3": mh0_n + mw_n + tr_m,
-        "V_1_4": global_W_sum + curr_v_sq_n - u_n, "H_1_4": phq_n + pw_n + tr_f, "Mr_1_4": global_W_M_sum + curr_mr_sq_n + mu_n, "Mo_1_4": mhq_n + mw_n + tr_m,
+        "V_1_1": sum_W_n - u_n, "H_1_1": ph0_n + pw_n + tr_f, "Mr_1_1": sum_W_x_n + mu_n, "Mo_1_1": mh0_n + mw_n + tr_m,
+        "V_1_2": sum_W_n - u_n, "H_1_2": phq_n + pw_n + tr_f, "Mr_1_2": sum_W_x_n + mu_n, "Mo_1_2": mhq_n + mw_n + tr_m,
+        "V_1_3": sum_W_n + curr_v_sq_n - u_n, "H_1_3": ph0_n + pw_n + tr_f, "Mr_1_3": sum_W_x_n + curr_mr_sq_n + mu_n,
+        "Mo_1_3": mh0_n + mw_n + tr_m,
+        "V_1_4": sum_W_n + curr_v_sq_n - u_n, "H_1_4": phq_n + pw_n + tr_f, "Mr_1_4": sum_W_x_n + curr_mr_sq_n + mu_n,
+        "Mo_1_4": mhq_n + mw_n + tr_m,
 
-        "V_2_1": global_W_sum - u_n, "H_2_1": ph0_s + eq_f + pw_n + dw_f, "Mr_2_1": global_W_M_sum + mu_n, "Mo_2_1": mh0_s + eq_m + mw_n + dw_m,
-        "V_2_2": global_W_sum - u_n, "H_2_2": phq_s + eq_f + pw_n + dw_f, "Mr_2_2": global_W_M_sum + mu_n, "Mo_2_2": mhq_s + eq_m + mw_n + dw_m,
-        "V_2_3": global_W_sum + curr_v_sq_s - u_n, "H_2_3": ph0_s + eq_f + eq_f_sq + pw_n + dw_f, "Mr_2_3": global_W_M_sum + curr_mr_sq_s + mu_n, "Mo_2_3": mh0_s + eq_m + eq_m_sq + mw_n + dw_m,
-        "V_2_4": global_W_sum + curr_v_sq_s - u_n, "H_2_4": phq_s + eq_f + eq_f_sq + pw_n + dw_f, "Mr_2_4": global_W_M_sum + curr_mr_sq_s + mu_n, "Mo_2_4": mhq_s + eq_m + eq_m_sq + mw_n + dw_m
+        "V_2_1": sum_W_n - u_n, "H_2_1": ph0_s + eq_f + pw_n + dw_f, "Mr_2_1": sum_W_x_n + mu_n,
+        "Mo_2_1": mh0_s + eq_m + mw_n + dw_m,
+        "V_2_2": sum_W_n - u_n, "H_2_2": phq_s + eq_f + pw_n + dw_f, "Mr_2_2": sum_W_x_n + mu_n,
+        "Mo_2_2": mhq_s + eq_m + mw_n + dw_m,
+        "V_2_3": sum_W_n + curr_v_sq_s - u_n, "H_2_3": ph0_s + eq_f + eq_f_sq + pw_n + dw_f,
+        "Mr_2_3": sum_W_x_n + curr_mr_sq_s + mu_n, "Mo_2_3": mh0_s + eq_m + eq_m_sq + mw_n + dw_m,
+        "V_2_4": sum_W_n + curr_v_sq_s - u_n, "H_2_4": phq_s + eq_f + eq_f_sq + pw_n + dw_f,
+        "Mr_2_4": sum_W_x_n + curr_mr_sq_s + mu_n, "Mo_2_4": mhq_s + eq_m + eq_m_sq + mw_n + dw_m
     })
-    current_elev = bot_elev
 
+    current_elev = bot_elev
+    prev_b = b
 
 # =====================================================================
 # ★ 누적 하중(from) 누락 오류가 완벽히 수정된 토압 산출표 생성 함수
@@ -1342,70 +1305,44 @@ def generate_earth_pressure_html(tiers_df, ka, q_val, rwl, c_top, g_wet, g_sub, 
         html += "</table>"
         html += "</div>"
 
-        svg_height = 420;
-        svg_width = 340
-        html += f"<div style='flex: 1.0; background: #fff; border: 1px solid #bbb; padding: 5px; text-align: center; overflow-x: auto;'>"
-        html += f"<div style='font-size:12px; font-weight:bold; margin-bottom:5px; color:#444;'>토압강도도 (단위: kN/m²)</div>"
-        html += f"<svg width='{svg_width}' height='{svg_height}' style='font-family:sans-serif; font-size:11px;'>"
-
-        max_pa = max([n["pa"] for n in nodes]) if nodes else 35.0
-        scale_x = 180 / max_pa if max_pa > 0 else 1
-        origin_x = 85
-
+        # ★ Word 호환을 위한 Matplotlib Base64 이미지 변환 적용
+        fig, ax = plt.subplots(figsize=(3.4, 4.2))
         el_max = nodes[0]["el"]
         el_min = nodes[-1]["el"]
         el_range = el_max - el_min if el_max != el_min else 1.0
-        draw_height = 360.0
-
-        def get_y(el):
-            return 20 + (el_max - el) / el_range * draw_height
-
-        pts = ""
-        for n in nodes:
-            y_pos = get_y(n["el"])
-            x_pos = origin_x + n["pa"] * scale_x
-            pts += f"{x_pos},{y_pos} "
-        last_y = get_y(el_min)
-        top_y = get_y(el_max)
-        pts += f"{origin_x},{last_y} {origin_x},{top_y}"
-
-        html += f"<polygon points='{pts}' fill='#f0f4f8' stroke='#2c3e50' stroke-width='1.5'/>"
-        html += f"<line x1='{origin_x}' y1='{top_y}' x2='{origin_x}' y2='{last_y}' stroke='black' stroke-width='2'/>"
-
+        max_pa = max([n["pa"] for n in nodes]) if nodes else 35.0
+        
+        y_vals = [n["el"] for n in nodes]
+        x_vals = [n["pa"] for n in nodes]
+        
+        ax.fill_betweenx(y_vals, 0, x_vals, facecolor='#f0f4f8', edgecolor='#2c3e50', linewidth=1.5)
+        ax.plot([0, 0], [el_min, el_max], color='black', linewidth=2)
+        
         for i, n in enumerate(nodes):
-            y_pos = get_y(n["el"])
-            level_str = f"({'+' if n['el'] >= 0 else '-'}){abs(n['el']):.3f}"
+            y_pos = n["el"]
             pa_val = n["pa"]
+            level_str = f"({'+' if y_pos >= 0 else '-'}){abs(y_pos):.3f}"
+            
+            ax.text(-max_pa * 0.05, y_pos, level_str, ha='right', va='center', fontsize=9, fontweight='bold')
+            if pa_val > 0.001:
+                ax.annotate("", xy=(pa_val, y_pos), xytext=(0, y_pos), arrowprops=dict(arrowstyle="->", color="#1a73e8", lw=1))
+                ax.text(pa_val + max_pa * 0.05, y_pos, f"{pa_val:.2f}", color='#d35400', fontsize=9, fontweight='bold', va='center')
+        
+        ax.set_ylim(el_min - el_range * 0.05, el_max + el_range * 0.05)
+        ax.set_xlim(-max_pa * 0.3, max_pa * 1.3)
+        ax.axis('off')
+        
+        buf = io.BytesIO()
+        fig.savefig(buf, format='png', bbox_inches='tight', dpi=150)
+        plt.close(fig)
+        buf.seek(0)
+        img_b64 = base64.b64encode(buf.read()).decode('utf-8')
+        
+        html += f"<div style='flex: 1.0; background: #fff; border: 1px solid #bbb; padding: 5px; text-align: center; overflow-x: auto;'>"
+        html += f"<div style='font-size:12px; font-weight:bold; margin-bottom:5px; color:#444;'>토압강도도 (단위: kN/m²)</div>"
+        html += f"<img src='data:image/png;base64,{img_b64}' style='max-width:100%; height:auto;'>"
+        html += "</div></div>"
 
-            is_duplicate_el = (i > 0 and nodes[i - 1]['el'] == n['el'])
-
-            if not is_duplicate_el:
-                html += f"<text x='{origin_x - 8}' y='{y_pos + 4}' text-anchor='end' font-size='10' font-weight='bold'>{level_str}</text>"
-                html += f"<line x1='{origin_x - 5}' y1='{y_pos}' x2='{origin_x}' y2='{y_pos}' stroke='black'/>"
-            else:
-                html += f"<line x1='{origin_x - 3}' y1='{y_pos}' x2='{origin_x}' y2='{y_pos}' stroke='black' stroke-width='1'/>"
-
-            x_pos = origin_x + pa_val * scale_x
-
-            text_y_offset = 3
-            if is_duplicate_el:
-                text_y_offset = 12
-            elif i < len(nodes) - 1 and nodes[i + 1]['el'] == n['el']:
-                text_y_offset = -5
-
-            html += f"<line x1='{origin_x}' y1='{y_pos}' x2='{x_pos}' y2='{y_pos}' stroke='#1a73e8' stroke-width='1'/>"
-            html += f"<polygon points='{origin_x},{y_pos} {origin_x + 6},{y_pos - 3} {origin_x + 6},{y_pos + 3}' fill='#1a73e8'/>"
-
-            val_text = f"{pa_val:.2f}"
-            html += f"<text x='{x_pos + 6}' y='{y_pos + text_y_offset}' font-size='10' fill='#d35400' font-weight='bold'>{val_text}</text>"
-
-            if i < len(nodes) - 1:
-                next_y = get_y(nodes[i + 1]['el'])
-                if next_y > y_pos + 1:
-                    mid_y = (y_pos + next_y) / 2
-                    html += f"<text x='{origin_x + 15}' y='{mid_y + 3}' font-size='10' fill='#555'>{i + 1}</text>"
-
-        html += "</svg></div></div>"
 
         html += f"<div style='margin-top: 15px; margin-bottom: 25px;'>"
         html += "<table style='width:100%; border-collapse: collapse; text-align:center; border: 2px solid #333; font-size:12px;'>"
@@ -1571,58 +1508,59 @@ def generate_earth_pressure_html(tiers_df, ka, q_val, rwl, c_top, g_wet, g_sub, 
             html += "</tr>"
         html += "</table></div>"
 
-        svg_height = 420;
-        svg_width = 340
-        html += f"<div style='flex: 1.0; background: #fff; border: 1px solid #bbb; padding: 5px; text-align: center; overflow-x: auto;'>"
-        html += f"<div style='font-size:12px; font-weight:bold; margin-bottom:5px; color:#444;'>토압강도도 (단위: kN/m²)</div>"
-        html += f"<svg width='{svg_width}' height='{svg_height}' style='font-family:sans-serif; font-size:11px;'>"
-
-        max_pa = max([n["pa"] for n in nodes]) if nodes else 35.0
-        scale_x = 180 / max_pa if max_pa > 0 else 1
-        origin_x = 85
-
+        # ★ Word 호환을 위한 Matplotlib Base64 이미지 변환 적용 (토압강도도)
+        fig, ax = plt.subplots(figsize=(2.5, 3.5))
         el_max = nodes[0]["el"]
         el_min = nodes[-1]["el"]
         el_range = el_max - el_min if el_max != el_min else 1.0
-        draw_height = 360.0
-
-        def get_y_normal(el):
-            return 20 + (el_max - el) / el_range * draw_height
-
-        pts = ""
-        for n in nodes:
-            y_pos = get_y_normal(n["el"])
-            x_pos = origin_x + n["pa"] * scale_x
-            pts += f"{x_pos},{y_pos} "
-        last_y = get_y_normal(el_min)
-        top_y = get_y_normal(el_max)
-        pts += f"{origin_x},{last_y} {origin_x},{top_y}"
-
-        html += f"<polygon points='{pts}' fill='#f0f4f8' stroke='#2c3e50' stroke-width='1.5'/>"
-        html += f"<line x1='{origin_x}' y1='{top_y}' x2='{origin_x}' y2='{last_y}' stroke='black' stroke-width='2'/>"
-
+        max_pa = max([n["pa"] for n in nodes]) if nodes else 35.0
+        
+        y_vals = [n["el"] for n in nodes]
+        x_vals = [n["pa"] for n in nodes]
+        
+        ax.fill_betweenx(y_vals, 0, x_vals, facecolor='#f0f4f8', edgecolor='#2c3e50', linewidth=1.5)
+        ax.plot([0, 0], [el_min, el_max], color='black', linewidth=2)
+        
         for i, n in enumerate(nodes):
-            y_pos = get_y_normal(n["el"])
-            level_str = f"({'+' if n['el'] >= 0 else '-'}){abs(n['el']):.3f}"
+            y_pos = n["el"]
             pa_val = n["pa"]
-
-            html += f"<text x='{origin_x - 8}' y='{y_pos + 4}' text-anchor='end' font-size='10' font-weight='bold'>{level_str}</text>"
-            html += f"<line x1='{origin_x - 5}' y1='{y_pos}' x2='{origin_x}' y2='{y_pos}' stroke='black'/>"
-
-            x_pos = origin_x + pa_val * scale_x
-            html += f"<line x1='{origin_x}' y1='{y_pos}' x2='{x_pos}' y2='{y_pos}' stroke='#1a73e8' stroke-width='1'/>"
-            html += f"<polygon points='{origin_x},{y_pos} {origin_x + 6},{y_pos - 3} {origin_x + 6},{y_pos + 3}' fill='#1a73e8'/>"
-
-            val_text = f"{pa_val:.2f}"
-            html += f"<text x='{x_pos + 6}' y='{y_pos + 3}' font-size='10' fill='#d35400' font-weight='bold'>{val_text}</text>"
-
+            level_str = f"({'+' if y_pos >= 0 else '-'}){abs(y_pos):.3f}"
+            
+            # 중복 레벨 텍스트 방지 (바로 위 노드와 높이가 같으면 생략)
+            is_duplicate_el = (i > 0 and abs(nodes[i - 1]['el'] - y_pos) < 0.001)
+            
+            if not is_duplicate_el:
+                ax.text(-max_pa * 0.05, y_pos, level_str, ha='right', va='center', fontsize=8, fontweight='bold')
+                
+            if pa_val > 0.001:
+                ax.annotate("", xy=(pa_val, y_pos), xytext=(0, y_pos), arrowprops=dict(arrowstyle="->", color="#1a73e8", lw=1))
+                # 텍스트 겹침 방지 설정
+                va_align = 'bottom' if is_duplicate_el else ('top' if i < len(nodes)-1 and abs(nodes[i+1]['el']-y_pos)<0.001 else 'center')
+                ax.text(pa_val + max_pa * 0.05, y_pos, f"{pa_val:.2f}", color='#d35400', fontsize=8, fontweight='bold', va=va_align)
+            elif not is_duplicate_el:
+                ax.text(max_pa * 0.05, y_pos, "0.00", color='#d35400', fontsize=8, fontweight='bold', va='center')
+                
+            # 구간 번호 표시
             if i < len(nodes) - 1:
-                next_y = get_y_normal(nodes[i + 1]['el'])
-                if next_y > y_pos + 1:
-                    mid_y = (y_pos + next_y) / 2
-                    html += f"<text x='{origin_x + 15}' y='{mid_y + 3}' font-size='10' fill='#555'>{i + 1}</text>"
-
-        html += "</svg></div></div>"
+                next_y = nodes[i + 1]['el']
+                if abs(y_pos - next_y) > 0.001:
+                    mid_y = (y_pos + next_y) / 2.0
+                    ax.text(max_pa * 0.15, mid_y, str(i + 1), color='#555', fontsize=8, va='center')
+        
+        ax.set_ylim(el_min - el_range * 0.05, el_max + el_range * 0.05)
+        ax.set_xlim(-max_pa * 0.4, max_pa * 1.4)
+        ax.axis('off')
+        
+        buf = io.BytesIO()
+        fig.savefig(buf, format='png', bbox_inches='tight', dpi=150)
+        plt.close(fig)
+        buf.seek(0)
+        img_b64 = base64.b64encode(buf.read()).decode('utf-8')
+        
+        html += f"<div style='flex: 1.0; background: #fff; border: 1px solid #bbb; padding: 5px; text-align: center; overflow-x: auto;'>"
+        html += f"<div style='font-size:12px; font-weight:bold; margin-bottom:5px; color:#444;'>토압강도도 (단위: kN/m²)</div>"
+        html += f"<img src='data:image/png;base64,{img_b64}' style='max-width:100%; height:auto;'>"
+        html += "</div></div>"
 
         html += f"<div style='margin-top: 15px;'>"
         html += "<table style='width:100%; border-collapse: collapse; text-align:center; border: 2px solid #333; font-size:12px;'>"
@@ -1732,58 +1670,51 @@ def generate_water_pressure_html(tiers_df, hwl, llw, rwl, c_top, g_w=10.0):
     bot_el_last = c_top - tiers_df["높이 H(m)"].astype(float).sum()
 
     # -----------------------------------------------------------------
-    # ★ 잔류수압 분포도 (SVG) 생성 로직
+    # ★ 잔류수압 분포도 (PNG 이미지) 생성 로직 (MS Word 완벽 호환)
     # -----------------------------------------------------------------
-    svg_width = 340
-    svg_height = 190  # 🔹 높이를 320에서 190으로 줄여 왼쪽 표와 균형을 맞춤
-    origin_x = 85
-
-    # 🔹 위쪽 여백을 자르기 위해 c_top(구조물 상단)을 제외하고 rwl(잔류수위) 기준으로 상단 높이 설정
+    fig, ax = plt.subplots(figsize=(2.5, 2.5))
     el_max = rwl + 0.5
-
     el_min = bot_el_last - 0.5
     el_range = el_max - el_min if el_max != el_min else 1.0
-    draw_height = svg_height - 40
 
-    def get_y(el):
-        return 20 + (el_max - el) / el_range * draw_height
+    y_vals = [rwl, llw, bot_el_last]
+    x_vals = [0.0, max_pw, max_pw]
 
-    y_rwl = get_y(rwl)
-    y_llw = get_y(llw)
-    y_bot = get_y(bot_el_last)
-
-    scale_x = 150 / max_pw if max_pw > 0 else 1.0
-    x_max = origin_x + max_pw * scale_x
-
-    pts = f"{origin_x},{y_rwl} {x_max},{y_llw} {x_max},{y_bot} {origin_x},{y_bot}"
-
-    svg_html = f"<div style='font-size:12px; font-weight:bold; margin-bottom:5px; color:#444;'>잔류수압 분포도 (단위: kN/m²)</div>"
-    svg_html += f"<svg width='{svg_width}' height='{svg_height}' style='font-family:sans-serif; font-size:11px;'>"
-    svg_html += f"<polygon points='{pts}' fill='#e1f5fe' stroke='#0277bd' stroke-width='1.5'/>"
-    svg_html += f"<line x1='{origin_x}' y1='{10}' x2='{origin_x}' y2='{svg_height - 10}' stroke='black' stroke-width='2'/>"
+    ax.fill_betweenx(y_vals, 0, x_vals, facecolor='#e1f5fe', edgecolor='#0277bd', linewidth=1.5)
+    ax.plot([0, 0], [el_min, el_max], color='black', linewidth=2)
 
     nodes_wp = [
-        {"el": rwl, "pw": 0.0, "y": y_rwl, "is_llw": False},
-        {"el": llw, "pw": max_pw, "y": y_llw, "is_llw": True},
-        {"el": bot_el_last, "pw": max_pw, "y": y_bot, "is_llw": False}
+        {"el": rwl, "pw": 0.0, "is_llw": False},
+        {"el": llw, "pw": max_pw, "is_llw": True},
+        {"el": bot_el_last, "pw": max_pw, "is_llw": False}
     ]
 
     for n in nodes_wp:
-        level_str = f"({'+' if n['el'] >= 0 else '-'}){abs(n['el']):.3f}"
-        svg_html += f"<text x='{origin_x - 8}' y='{n['y'] + 4}' text-anchor='end' font-size='10' font-weight='bold'>{level_str}</text>"
-        svg_html += f"<line x1='{origin_x - 5}' y1='{n['y']}' x2='{origin_x}' y2='{n['y']}' stroke='black'/>"
-
-        x_pos = origin_x + n['pw'] * scale_x
-        if n['pw'] > 0:
-            svg_html += f"<line x1='{origin_x}' y1='{n['y']}' x2='{x_pos}' y2='{n['y']}' stroke='#0277bd' stroke-width='1' stroke-dasharray='2,2'/>"
-            svg_html += f"<polygon points='{origin_x},{n['y']} {origin_x + 6},{n['y'] - 3} {origin_x + 6},{n['y'] + 3}' fill='#0277bd'/>"
-
-            y_text = n['y'] + 12 if n['is_llw'] else n['y'] + 4
-            svg_html += f"<text x='{x_pos + 6}' y='{y_text}' font-size='10' fill='#d35400' font-weight='bold'>{n['pw']:.2f}</text>"
+        y_pos = n['el']
+        pw_val = n['pw']
+        level_str = f"({'+' if y_pos >= 0 else '-'}){abs(y_pos):.3f}"
+        
+        ax.text(-max_pw * 0.05, y_pos, level_str, ha='right', va='center', fontsize=9, fontweight='bold')
+        
+        if pw_val > 0.001:
+            ax.annotate("", xy=(pw_val, y_pos), xytext=(0, y_pos), arrowprops=dict(arrowstyle="->", color="#0277bd", lw=1))
+            va_align = 'top' if n['is_llw'] else 'bottom'
+            ax.text(pw_val + max_pw * 0.05, y_pos, f"{pw_val:.2f}", color='#d35400', fontsize=9, fontweight='bold', va=va_align)
         else:
-            svg_html += f"<text x='{origin_x + 6}' y='{n['y'] + 4}' font-size='10' fill='#d35400' font-weight='bold'>0.00</text>"
+            ax.text(max_pw * 0.05, y_pos, "0.00", color='#d35400', fontsize=9, fontweight='bold', va='center')
 
-    svg_html += "</svg>"
+    ax.set_ylim(el_min - el_range * 0.05, el_max + el_range * 0.05)
+    ax.set_xlim(-max_pw * 0.4, max_pw * 1.4)
+    ax.axis('off')
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format='png', bbox_inches='tight', dpi=150)
+    plt.close(fig)
+    buf.seek(0)
+    img_b64 = base64.b64encode(buf.read()).decode('utf-8')
+
+    svg_html = f"<div style='font-size:12px; font-weight:bold; margin-bottom:5px; color:#444;'>잔류수압 분포도 (단위: kN/m²)</div>"
+    svg_html += f"<img src='data:image/png;base64,{img_b64}' style='max-width:100%; height:auto;'>"
 
     # -----------------------------------------------------------------
     # ★ 2. 잔류수압 표 (줄간격 넓힘) + 분포도 HTML 통합 반환
@@ -1970,58 +1901,60 @@ def generate_water_pressure_html(tiers_df, hwl, llw, rwl, c_top, g_w=10.0):
     return html
 
 
-# ==========================================
-# [수정된 메인 데이터 동기화 루프]
-# 하중집계표를 그리기 전에 이 코드가 반드시 실행되어야 합니다.
-# ==========================================
-current_elev = c_top  # 최상단 기준 고도 (예: c_top)
+def generate_surcharge_html(tiers_df, q_val, c_top):
+    html = "<table style='width:100%; border-collapse: collapse; text-align:center; border: 2px solid #333; font-size:12px; margin-bottom: 25px;'>"
+    html += "<tr style='background-color:#d9d9d9;'>"
+    html += "<th style='border:1px solid #ccc; padding:8px;'>구 분</th>"
+    html += "<th style='border:1px solid #ccc; padding:8px;'>기준점</th>"
+    html += "<th style='border:1px solid #ccc; padding:8px;'>P(kN) 산식</th>"
+    html += "<th style='border:1px solid #ccc; padding:8px;'>연직력 P(kN)</th>"
+    html += "<th style='border:1px solid #ccc; padding:8px;'>모멘트 Mᵥ(kN·m) 산식</th>"
+    html += "<th style='border:1px solid #ccc; padding:8px;'>모멘트 Mᵥ(kN·m)</th>"
+    html += "<th style='border:1px solid #ccc; padding:8px;'>비고</th>"
+    html += "</tr>"
 
-for idx, row in edited_tiers.iterrows():
-    h = float(row["높이 H(m)"])
-    b = float(row["폭 B(m)"])
-    out_h = float(row.get("전면돌출(m)", 0.0)) if pd.notna(row.get("전면돌출(m)")) else 0.0
-    bot_elev = current_elev - h
-    is_last = (idx == len(edited_tiers) - 1)
+    current_elev = c_top
+    for idx, row in tiers_df.iterrows():
+        h = float(row["높이 H(m)"])
+        b = float(row["폭 B(m)"])
+        bot_elev = current_elev - h
+        is_last = (idx == len(tiers_df) - 1)
 
-    # 1. 상재하중 표와 '100% 동일한 공식'으로 유효폭 및 팔길이 연산
-    if is_last:
-        eff_b = b - out_h
-        arm = out_h + (eff_b / 2.0)
-    else:
-        eff_b = b
-        arm = eff_b / 2.0
+        if is_last:
+            eff_b = b - 1.0
+            p_val = q_val * eff_b
+            arm = 1.0 + (eff_b / 2.0)
+            arm_str = f"1.0 + {eff_b:.2f} / 2"
+        else:
+            eff_b = b
+            p_val = q_val * eff_b
+            arm = eff_b / 2.0
+            arm_str = f"{eff_b:.2f} / 2"
 
-    # ★ 평상시(q_n)와 지진시(q_s) 상재하중 분리 계산
-    p_val_n = q_n * eff_b
-    mv_val_n = p_val_n * arm
+        mv_val = p_val * arm
 
-    p_val_s = q_s * eff_b
-    mv_val_s = p_val_s * arm
+        sign_str = "+" if bot_elev >= 0 else "-"
+        level_str = f"DL({sign_str}){abs(bot_elev):.2f}"
 
-    # 2. 하중집계표 텍스트 출력용으로 딕셔너리에 각각 저장
-    tier_details[idx]['v_sq_n'] = p_val_n
-    tier_details[idx]['v_sq_s'] = p_val_s
-    tier_details[idx]['mr_sq_n'] = mv_val_n
-    tier_details[idx]['mr_sq_s'] = mv_val_s
+        html += "<tr>"
+        html += f"<td style='border:1px solid #ccc; padding:6px; font-weight:bold;'>{level_str}</td>"
+        html += f"<td style='border:1px solid #ccc; padding:6px;'>항외측 TOE</td>"
+        html += f"<td style='border:1px solid #ccc; padding:6px;'>{q_val:.2f} × {eff_b:.2f}</td>"
+        html += f"<td style='border:1px solid #ccc; padding:6px; font-weight:bold;'>{p_val:.2f}</td>"
+        html += f"<td style='border:1px solid #ccc; padding:6px;'>{p_val:.2f} × ({arm_str})</td>"
+        html += f"<td style='border:1px solid #ccc; padding:6px; font-weight:bold; color:#1a73e8;'>{mv_val:.2f}</td>"
+        html += f"<td style='border:1px solid #ccc; padding:6px;'></td>"
+        html += "</tr>"
 
-    # 3. 기존 자중 값에 위에서 구한 정확한 상재하중 값을 더해서 최종 집계값(V, Mr) 업데이트
-    w_n = tier_details[idx].get('sum_W_n', 0.0)
-    wx_n = tier_details[idx].get('sum_W_x_n', 0.0)
+        current_elev = bot_elev
 
-    # 평상시 (CASE 1-3, 1-4) -> q_n 적용
-    tier_details[idx]['V_1_3'] = w_n + p_val_n
-    tier_details[idx]['V_1_4'] = w_n + p_val_n
-    tier_details[idx]['Mr_1_3'] = wx_n + mv_val_n
-    tier_details[idx]['Mr_1_4'] = wx_n + mv_val_n
+    html += "</table>"
+    return html
 
-    # 지진시 (CASE 2-3, 2-4) -> q_s 적용
-    tier_details[idx]['V_2_3'] = w_n + p_val_s
-    tier_details[idx]['V_2_4'] = w_n + p_val_s
-    tier_details[idx]['Mr_2_3'] = wx_n + mv_val_s
-    tier_details[idx]['Mr_2_4'] = wx_n + mv_val_s
 
-    current_elev = bot_elev
-
+# =====================================================================
+# ★ 검토단면에 DL 검토높이 표기가 추가된 CASE별 하중집계 테이블 생성 함수
+# =====================================================================
 
 def generate_case_summary_table(case_title, case_key, tiers_details):
     html = f"<div style='margin-top: 15px;'><b>■ {case_title}</b></div>"
@@ -2062,16 +1995,14 @@ def generate_case_summary_table(case_title, case_key, tiers_details):
         elif case_key == "1_3":
             v_parts = [f"자중 {t['sum_W_n']:.2f}"]
             if t['v_sq_n'] > 0: v_parts.append(f"상재연직 {t['v_sq_n']:.2f}")
-            v_str = f"<b>{v_val:.2f}</b> (" + " + ".join(v_parts) + ")" if len(
-                v_parts) > 1 else f"<b>{v_val:.2f}</b> (자중)"
+            v_str = f"<b>{v_val:.2f}</b> (" + " + ".join(v_parts) + ")" if len(v_parts) > 1 else f"<b>{v_val:.2f}</b> (자중)"
             h_parts = [f"토압(상재無) {t['ph0_n']:.2f}"] if t['ph0_n'] > 0 else []
             if t['pw_n'] > 0: h_parts.append(f"잔류수압 {t['pw_n']:.2f}")
             if t['tr_f'] > 0: h_parts.append(f"견인력 {t['tr_f']:.2f}")
             h_str = f"<b>{h_val:.2f}</b> (" + " + ".join(h_parts) + ")"
             mr_parts = [f"자중모멘트 {t['sum_W_x_n']:.2f}"]
             if t['mr_sq_n'] > 0: mr_parts.append(f"상재모멘트 {t['mr_sq_n']:.2f}")
-            mr_str = f"<b>{mr_val:.2f}</b> (" + " + ".join(mr_parts) + ")" if len(
-                mr_parts) > 1 else f"<b>{mr_val:.2f}</b> (자중모멘트)"
+            mr_str = f"<b>{mr_val:.2f}</b> (" + " + ".join(mr_parts) + ")" if len(mr_parts) > 1 else f"<b>{mr_val:.2f}</b> (자중모멘트)"
             mo_parts = [f"토압모멘트(無) {t['mh0_n']:.2f}"] if t['mh0_n'] > 0 else []
             if t['mw_n'] > 0: mo_parts.append(f"잔류수압모멘트 {t['mw_n']:.2f}")
             if t['tr_m'] > 0: mo_parts.append(f"견인력모멘트 {t['tr_m']:.2f}")
@@ -2080,16 +2011,14 @@ def generate_case_summary_table(case_title, case_key, tiers_details):
         elif case_key == "1_4":
             v_parts = [f"자중 {t['sum_W_n']:.2f}"]
             if t['v_sq_n'] > 0: v_parts.append(f"상재연직 {t['v_sq_n']:.2f}")
-            v_str = f"<b>{v_val:.2f}</b> (" + " + ".join(v_parts) + ")" if len(
-                v_parts) > 1 else f"<b>{v_val:.2f}</b> (자중)"
+            v_str = f"<b>{v_val:.2f}</b> (" + " + ".join(v_parts) + ")" if len(v_parts) > 1 else f"<b>{v_val:.2f}</b> (자중)"
             h_parts = [f"토압(상재有) {t['phq_n']:.2f}"] if t['phq_n'] > 0 else []
             if t['pw_n'] > 0: h_parts.append(f"잔류수압 {t['pw_n']:.2f}")
             if t['tr_f'] > 0: h_parts.append(f"견인력 {t['tr_f']:.2f}")
             h_str = f"<b>{h_val:.2f}</b> (" + " + ".join(h_parts) + ")"
             mr_parts = [f"자중모멘트 {t['sum_W_x_n']:.2f}"]
             if t['mr_sq_n'] > 0: mr_parts.append(f"상재모멘트 {t['mr_sq_n']:.2f}")
-            mr_str = f"<b>{mr_val:.2f}</b> (" + " + ".join(mr_parts) + ")" if len(
-                mr_parts) > 1 else f"<b>{mr_val:.2f}</b> (자중모멘트)"
+            mr_str = f"<b>{mr_val:.2f}</b> (" + " + ".join(mr_parts) + ")" if len(mr_parts) > 1 else f"<b>{mr_val:.2f}</b> (자중모멘트)"
             mo_parts = [f"토압모멘트(有) {t['mhq_n']:.2f}"] if t['mhq_n'] > 0 else []
             if t['mw_n'] > 0: mo_parts.append(f"잔류수압모멘트 {t['mw_n']:.2f}")
             if t['tr_m'] > 0: mo_parts.append(f"견인력모멘트 {t['tr_m']:.2f}")
@@ -2123,8 +2052,7 @@ def generate_case_summary_table(case_title, case_key, tiers_details):
         elif case_key == "2_3":
             v_parts = [f"자중 {t['sum_W_n']:.2f}"]
             if t.get('v_sq_s', 0.0) > 0: v_parts.append(f"상재연직 {t.get('v_sq_s', 0.0):.2f}")
-            v_str = f"<b>{v_val:.2f}</b> (" + " + ".join(v_parts) + ")" if len(
-                v_parts) > 1 else f"<b>{v_val:.2f}</b> (자중)"
+            v_str = f"<b>{v_val:.2f}</b> (" + " + ".join(v_parts) + ")" if len(v_parts) > 1 else f"<b>{v_val:.2f}</b> (자중)"
             h_parts = [f"동토압(無) {t.get('ph0_s', 0.0):.2f}", f"관성력(제체) {t.get('eq_f', 0.0):.2f}"]
             if t.get('eq_f_sq', 0.0) > 0: h_parts.append(f"관성력(상재) {t.get('eq_f_sq', 0.0):.2f}")
             if t.get('pw_n', 0.0) > 0: h_parts.append(f"잔류수압 {t.get('pw_n', 0.0):.2f}")
@@ -2132,8 +2060,7 @@ def generate_case_summary_table(case_title, case_key, tiers_details):
             h_str = f"<b>{h_val:.2f}</b> (" + " + ".join(h_parts) + ")"
             mr_parts = [f"자중모멘트 {t['sum_W_x_n']:.2f}"]
             if t.get('mr_sq_s', 0.0) > 0: mr_parts.append(f"상재모멘트 {t.get('mr_sq_s', 0.0):.2f}")
-            mr_str = f"<b>{mr_val:.2f}</b> (" + " + ".join(mr_parts) + ")" if len(
-                mr_parts) > 1 else f"<b>{mr_val:.2f}</b> (자중모멘트)"
+            mr_str = f"<b>{mr_val:.2f}</b> (" + " + ".join(mr_parts) + ")" if len(mr_parts) > 1 else f"<b>{mr_val:.2f}</b> (자중모멘트)"
             mo_parts = [f"동토압모멘트(無) {t.get('mh0_s', 0.0):.2f}", f"관성모멘트(제체) {t.get('eq_m', 0.0):.2f}"]
             if t.get('eq_m_sq', 0.0) > 0: mo_parts.append(f"관성모멘트(상재) {t.get('eq_m_sq', 0.0):.2f}")
             if t.get('mw_n', 0.0) > 0: mo_parts.append(f"잔류수압모멘트 {t.get('mw_n', 0.0):.2f}")
@@ -2143,8 +2070,7 @@ def generate_case_summary_table(case_title, case_key, tiers_details):
         elif case_key == "2_4":
             v_parts = [f"자중 {t['sum_W_n']:.2f}"]
             if t.get('v_sq_s', 0.0) > 0: v_parts.append(f"상재연직 {t.get('v_sq_s', 0.0):.2f}")
-            v_str = f"<b>{v_val:.2f}</b> (" + " + ".join(v_parts) + ")" if len(
-                v_parts) > 1 else f"<b>{v_val:.2f}</b> (자중)"
+            v_str = f"<b>{v_val:.2f}</b> (" + " + ".join(v_parts) + ")" if len(v_parts) > 1 else f"<b>{v_val:.2f}</b> (자중)"
             h_parts = [f"동토압(有) {t.get('phq_s', 0.0):.2f}", f"관성력(제체) {t.get('eq_f', 0.0):.2f}"]
             if t.get('eq_f_sq', 0.0) > 0: h_parts.append(f"관성력(상재) {t.get('eq_f_sq', 0.0):.2f}")
             if t.get('pw_n', 0.0) > 0: h_parts.append(f"잔류수압 {t.get('pw_n', 0.0):.2f}")
@@ -2152,8 +2078,7 @@ def generate_case_summary_table(case_title, case_key, tiers_details):
             h_str = f"<b>{h_val:.2f}</b> (" + " + ".join(h_parts) + ")"
             mr_parts = [f"자중모멘트 {t['sum_W_x_n']:.2f}"]
             if t.get('mr_sq_s', 0.0) > 0: mr_parts.append(f"상재모멘트 {t.get('mr_sq_s', 0.0):.2f}")
-            mr_str = f"<b>{mr_val:.2f}</b> (" + " + ".join(mr_parts) + ")" if len(
-                mr_parts) > 1 else f"<b>{mr_val:.2f}</b> (자중모멘트)"
+            mr_str = f"<b>{mr_val:.2f}</b> (" + " + ".join(mr_parts) + ")" if len(mr_parts) > 1 else f"<b>{mr_val:.2f}</b> (자중모멘트)"
             mo_parts = [f"동토압모멘트(有) {t.get('mhq_s', 0.0):.2f}", f"관성모멘트(제체) {t.get('eq_m', 0.0):.2f}"]
             if t.get('eq_m_sq', 0.0) > 0: mo_parts.append(f"관성모멘트(상재) {t.get('eq_m_sq', 0.0):.2f}")
             if t.get('mw_n', 0.0) > 0: mo_parts.append(f"잔류수압모멘트 {t.get('mw_n', 0.0):.2f}")
@@ -2171,69 +2096,6 @@ def generate_case_summary_table(case_title, case_key, tiers_details):
         html += f"<td style='border:1px solid #ccc; text-align:left; padding-left:10px;'>{mo_str}</td></tr>"
 
     return html + "</table>"
-
-
-def generate_surcharge_html(tiers_df, q_val, c_top, tier_details=None):
-    global_t_details = globals().get('tier_details', tier_details)
-    
-    is_eq = False
-    try:
-        q_s_val = globals().get('q_s', 0.0)
-        q_n_val = globals().get('q_n', 0.0)
-        if abs(q_val - q_s_val) < 0.001 and abs(q_s_val - q_n_val) > 0.001:
-            is_eq = True
-    except:
-        pass
-
-    html = "<table style='width:100%; border-collapse: collapse; text-align:center; border: 2px solid #333; font-size:12px; margin-bottom: 25px;'>"
-    html += "<tr style='background-color:#d9d9d9;'>"
-    html += "<th style='border:1px solid #ccc; padding:8px;'>구 분</th>"
-    html += "<th style='border:1px solid #ccc; padding:8px;'>기준점</th>"
-    html += "<th style='border:1px solid #ccc; padding:8px;'>P(kN) 산식</th>"
-    html += "<th style='border:1px solid #ccc; padding:8px;'>연직력 P(kN)</th>"
-    html += "<th style='border:1px solid #ccc; padding:8px;'>모멘트 Mᵥ(kN·m) 산식</th>"
-    html += "<th style='border:1px solid #ccc; padding:8px;'>모멘트 Mᵥ(kN·m)</th>"
-    html += "<th style='border:1px solid #ccc; padding:8px;'>비고</th>"
-    html += "</tr>"
-
-    current_elev = c_top
-    for idx, row in tiers_df.iterrows():
-        h = float(row["높이 H(m)"])
-        bot_elev = current_elev - h
-        
-        if global_t_details and idx < len(global_t_details):
-            t = global_t_details[idx]
-            p_val = t['v_sq_s'] if is_eq else t['v_sq_n']
-            mv_val = t['mr_sq_s'] if is_eq else t['mr_sq_n']
-        else:
-            p_val = 0.0; mv_val = 0.0
-            
-        arm = mv_val / p_val if p_val > 0 else 0.0
-        eff_b = p_val / q_val if q_val > 0 else 0.0
-        
-        sign_str = "+" if bot_elev >= 0 else "-"
-        level_str = f"DL({sign_str}){abs(bot_elev):.2f}"
-
-        html += "<tr>"
-        html += f"<td style='border:1px solid #ccc; padding:6px; font-weight:bold;'>{level_str}</td>"
-        html += f"<td style='border:1px solid #ccc; padding:6px;'>하부단 전면(항외측)</td>"
-        html += f"<td style='border:1px solid #ccc; padding:6px;'>{q_val:.2f} × {eff_b:.2f}</td>"
-        html += f"<td style='border:1px solid #ccc; padding:6px; font-weight:bold;'>{p_val:.2f}</td>"
-        html += f"<td style='border:1px solid #ccc; padding:6px;'>{p_val:.2f} × ({arm:.2f})</td>"
-        html += f"<td style='border:1px solid #ccc; padding:6px; font-weight:bold; color:#1a73e8;'>{mv_val:.2f}</td>"
-        html += f"<td style='border:1px solid #ccc; padding:6px;'></td>"
-        html += "</tr>"
-
-        current_elev = bot_elev
-
-    html += "</table>"
-    return html
-
-
-# =====================================================================
-# ★ 검토단면에 DL 검토높이 표기가 추가된 CASE별 하중집계 테이블 생성 함수
-# =====================================================================
-
 
 def generate_sliding_table(cases_info, tiers_details, fs_allow=1.2, mu_cc=0.5, mu_cb=0.6):
     html = "<div style='margin-top: 15px;'><b>■ 활동 안정 검토</b></div>"
@@ -2272,7 +2134,6 @@ def generate_sliding_table(cases_info, tiers_details, fs_allow=1.2, mu_cc=0.5, m
             html += "<td style='border:1px dotted #ccc;'></td></tr>"
 
     return html + "</table>"
-
 
 def generate_overturning_table(cases_info, tiers_details, fs_allow=1.2):
     html = "<div style='margin-top: 15px;'><b>■ 전도 안정 검토</b></div>"
@@ -2395,6 +2256,38 @@ def generate_bearing_table(cases_info, target_tier, qa_allow=500.0, mu=0.6):
 
 
 def generate_formula_html():
+    def get_formula_img(type_idx):
+        fig, ax = plt.subplots(figsize=(2.5, 1.2))
+        if type_idx == 1:
+            ax.plot([0, 1], [0, 0], 'k-', lw=2)
+            ax.add_patch(patches.Rectangle((0.3, 0), 0.4, 0.6, fill=False, lw=1.5))
+            ax.annotate("", xy=(0.5, 0), xytext=(0.5, 0.5), arrowprops=dict(arrowstyle="->", lw=1.5))
+            ax.text(0.5, 0.55, "ΣV", ha='center', va='bottom', fontweight='bold')
+            ax.annotate("", xy=(0.3, 0.3), xytext=(0.1, 0.3), arrowprops=dict(arrowstyle="->", lw=1.5))
+            ax.text(0.05, 0.3, "ΣH", ha='right', va='center', fontweight='bold')
+        elif type_idx == 2:
+            ax.plot([0, 1], [0, 0], 'k-', lw=2)
+            ax.add_patch(patches.Rectangle((0.3, 0), 0.4, 0.6, fill=False, lw=1.5))
+            ax.annotate("", xy=(0.3, 0), xytext=(0.2, 0.3), arrowprops=dict(arrowstyle="->", connectionstyle="arc3,rad=-0.5", lw=1.5))
+            ax.text(0.15, 0.35, "ΣMv", ha='center', fontweight='bold')
+            ax.annotate("", xy=(0.7, 0), xytext=(0.8, 0.3), arrowprops=dict(arrowstyle="->", connectionstyle="arc3,rad=0.5", lw=1.5))
+            ax.text(0.85, 0.35, "ΣMh", ha='center', fontweight='bold')
+        elif type_idx == 3:
+            ax.plot([0, 1], [0.8, 0.8], 'k-', lw=1.5)
+            ax.add_patch(patches.Polygon([[0.1, 0.8], [0.9, 0.8], [0.9, 0.5], [0.1, 0.6]], fill=True, facecolor='#f0f4f8', edgecolor='black'))
+            ax.text(0.5, 0.9, "e ≤ B/6", ha='center', fontsize=9)
+            ax.plot([0, 1], [0.3, 0.3], 'k-', lw=1.5)
+            ax.add_patch(patches.Polygon([[0.1, 0.3], [0.7, 0.3], [0.7, 0.0]], fill=True, facecolor='#f0f4f8', edgecolor='black'))
+            ax.text(0.5, 0.4, "e > B/6", ha='center', fontsize=9)
+        ax.set_xlim(0, 1)
+        ax.set_ylim(-0.1, 1)
+        ax.axis('off')
+        buf = io.BytesIO()
+        fig.savefig(buf, format='png', bbox_inches='tight', dpi=150)
+        plt.close(fig)
+        buf.seek(0)
+        return f"data:image/png;base64,{base64.b64encode(buf.read()).decode('utf-8')}"
+
     html = "<div style='display: flex; flex-direction: row; gap: 15px; margin-bottom: 25px; align-items: stretch;'>"
 
     html += "<div style='flex: 1; border: 1px solid #333; background: #fff; padding: 12px; display: flex; flex-direction: column; justify-content: space-between;'>"
@@ -2405,23 +2298,8 @@ def generate_formula_html():
     html += "<b>ΣV</b> : 연직력 합 (kN)<br>"
     html += "<b>ΣH</b> : 수평력 합 (kN)<br>"
     html += "<b>μ</b> : 마찰계수"
-    html += "</div>"
-    html += "</div>"
-    html += "<div style='text-align: center; margin-top: 15px;'>"
-    html += "<svg width='180' height='100' viewBox='0 0 180 100' style='background:#fff; border:1px solid #eee;'>"
-    html += "<line x1='20' y1='80' x2='160' y2='80' stroke='#000' stroke-width='2'/>"
-    html += "<rect x='50' y='30' width='80' height='50' fill='none' stroke='#000' stroke-width='1.5'/>"
-    html += "<polyline points='40,80 50,72 50,80' fill='none' stroke='#000' stroke-width='1'/>"
-    html += "<polyline points='140,80 130,72 130,80' fill='none' stroke='#000' stroke-width='1'/>"
-    html += "<line x1='90' y1='35' x2='90' y2='65' stroke='#000' stroke-width='2'/>"
-    html += "<polygon points='90,70 85,60 95,60' fill='#000'/>"
-    html += "<text x='90' y='28' text-anchor='middle' font-weight='bold' font-size='12'>ΣV</text>"
-    html += "<line x1='165' y1='50' x2='140' y2='50' stroke='#000' stroke-width='2'/>"
-    html += "<polygon points='135,50 143,45 143,55' fill='#000'/>"
-    html += "<text x='168' y='45' text-anchor='start' font-weight='bold' font-size='12'>ΣH</text>"
-    html += "</svg>"
-    html += "</div>"
-    html += "</div>"
+    html += "</div></div>"
+    html += f"<div style='text-align: center; margin-top: 15px;'><img src='{get_formula_img(1)}' style='border:1px solid #eee; max-width:180px;'></div></div>"
 
     html += "<div style='flex: 1; border: 1px solid #333; background: #fff; padding: 12px; display: flex; flex-direction: column; justify-content: space-between;'>"
     html += "<div>"
@@ -2430,23 +2308,8 @@ def generate_formula_html():
     html += "<div style='font-size: 12px; line-height: 1.5; color: #444;'>"
     html += "<b>ΣMv</b> : 연직력에 의한 모멘트 합 (kN·m)<br>"
     html += "<b>ΣMh</b> : 수평력에 의한 모멘트 합 (kN·m)"
-    html += "</div>"
-    html += "</div>"
-    html += "<div style='text-align: center; margin-top: 15px;'>"
-    html += "<svg width='180' height='100' viewBox='0 0 180 100' style='background:#fff; border:1px solid #eee;'>"
-    html += "<line x1='20' y1='80' x2='160' y2='80' stroke='#000' stroke-width='2'/>"
-    html += "<rect x='60' y='25' width='70' height='55' fill='none' stroke='#000' stroke-width='1.5'/>"
-    html += "<polyline points='45,80 55,75 60,75 60,80' fill='none' stroke='#000' stroke-width='1'/>"
-    html += "<polyline points='135,80 125,75 130,75 130,80' fill='none' stroke='#000' stroke-width='1'/>"
-    html += "<path d='M 35 60 A 18 18 0 1 1 50 72' fill='none' stroke='#000' stroke-width='2.5'/>"
-    html += "<polygon points='50,75 42,68 52,66' fill='#000'/>"
-    html += "<text x='38' y='55' font-weight='bold' font-size='11'>ΣMv</text>"
-    html += "<path d='M 115 42 A 18 18 0 1 1 95 60' fill='none' stroke='#000' stroke-width='2.5'/>"
-    html += "<polygon points='95,65 92,55 101,58' fill='#000'/>"
-    html += "<text x='105' y='52' font-weight='bold' font-size='11'>ΣMh</text>"
-    html += "</svg>"
-    html += "</div>"
-    html += "</div>"
+    html += "</div></div>"
+    html += f"<div style='text-align: center; margin-top: 15px;'><img src='{get_formula_img(2)}' style='border:1px solid #eee; max-width:180px;'></div></div>"
 
     html += "<div style='flex: 1.3; border: 1px solid #333; background: #fff; padding: 12px; display: flex; flex-direction: column; justify-content: space-between;'>"
     html += "<div>"
@@ -2457,33 +2320,8 @@ def generate_formula_html():
     html += "· <i>e</i> ≤ B/6 의 경우 : 사다리꼴 분포<br>"
     html += "· <i>e</i> &gt; B/6 의 경우 : 삼각형 분포 (B' = 3<i>x</i>, <i>q<sub>max</sub></i> = 2ΣV / B')<br><br>"
     html += "<b>ΣV</b> : 연직력 합 (kN), &nbsp;<b>B</b> : 저판의 폭 (m), &nbsp;<b>e</b> : 전합력의 편심량 (m)"
-    html += "</div>"
-    html += "</div>"
-    html += "<div style='text-align: center; margin-top: 15px;'>"
-    html += "<svg width='220' height='110' viewBox='0 0 220 110' style='background:#fff; border:1px solid #eee;'>"
-    html += "<line x1='10' y1='60' x2='210' y2='60' stroke='#000' stroke-width='1.5'/>"
-    html += "<rect x='25' y='20' width='60' height='40' fill='none' stroke='#000' stroke-width='1.2'/>"
-    html += "<line x1='55' y1='30' x2='55' y2='50' stroke='#000' stroke-width='1.5'/>"
-    html += "<polygon points='55,53 52,46 58,46' fill='#000'/>"
-    html += "<text x='62' y='42' font-size='9' font-weight='bold'>ΣV</text>"
-    html += "<line x1='55' y1='30' x2='40' y2='30' stroke='#000' stroke-width='1.5'/>"
-    html += "<polygon points='37,30 43,27 43,33' fill='#000'/>"
-    html += "<text x='42' y='24' font-size='9' font-weight='bold'>ΣH</text>"
-    html += "<line x1='55' y1='30' x2='38' y2='50' stroke='#000' stroke-width='1.8'/>"
-    html += "<polygon points='35,53 38,45 44,49' fill='#000'/>"
-    html += "<text x='30' y='42' font-size='9' font-weight='bold'>R</text>"
-    html += "<line x1='110' y1='20' x2='190' y2='20' stroke='#000' stroke-width='1'/>"
-    html += "<polygon points='110,20 110,40 190,30 190,20' fill='#f0f4f8' stroke='#000' stroke-width='1'/>"
-    html += "<text x='102' y='38' font-size='8' font-weight='bold'>p1</text>"
-    html += "<text x='193' y='28' font-size='8' font-weight='bold'>p2</text>"
-    html += "<text x='150' y='50' text-anchor='middle' font-size='9'>e ≤ B/6</text>"
-    html += "<line x1='110' y1='70' x2='190' y2='70' stroke='#000' stroke-width='1'/>"
-    html += "<polygon points='110,70 110,95 170,70' fill='#f0f4f8' stroke='#000' stroke-width='1'/>"
-    html += "<text x='102' y='92' font-size='8' font-weight='bold'>p1</text>"
-    html += "<text x='150' y='105' text-anchor='middle' font-size='9'>e &gt; B/6</text>"
-    html += "</svg>"
-    html += "</div>"
-    html += "</div>"
+    html += "</div></div>"
+    html += f"<div style='text-align: center; margin-top: 15px;'><img src='{get_formula_img(3)}' style='border:1px solid #eee; max-width:220px;'></div></div>"
 
     html += "</div>"
     return html
@@ -2504,15 +2342,9 @@ else:
 mu_cc = 0.5  # 콘크리트 상호간 마찰계수
 mu_cb = 0.6  # 콘크리트-사석 마찰계수
 
-min_sl = 999.0;
-min_sl_case = "";
-min_sl_tier = ""
-min_ot = 999.0;
-min_ot_case = "";
-min_ot_tier = ""
-max_q = 0.0;
-max_q_case = "";
-max_q_tier = ""
+min_sl = 999.0; min_sl_case = ""; min_sl_tier = ""
+min_ot = 999.0; min_ot_case = ""; min_ot_tier = ""
+max_q = 0.0; max_q_case = ""; max_q_tier = ""
 
 for c_label, c_key in cases_summary_list:
     formatted_case_name = f"CASE {c_key.replace('_', '-')}"
@@ -2548,7 +2380,7 @@ for c_label, c_key in cases_summary_list:
             max_q = q_v
             max_q_case = f"{formatted_case_name} ({t['name']})"
 
-allow_fs = 1.1 if is_eq_mode else 1.2
+allow_fs = 1.0 if is_eq_mode else 1.2
 allow_qa = qa_s if is_eq_mode else qa_n
 
 summary_html = f"""
@@ -2647,7 +2479,7 @@ design_cond_html = f"""
 <tr><td style='border: 1px solid #ccc;'>CASE 2-4</td><td style='border: 1px solid #ccc; text-align:left; padding-left:15px;'>자중 + 상재하중 + 동토압(상재有) + 잔류수압 + 관성력(제체+상재) + 동수압</td></tr>
 <tr style='background-color: #fdf2e9; color:#e67e22;'><th colspan='3' style='border: 1px solid #ccc; padding: 8px;'>6) 허용안전율 및 허용지지력</th></tr>
 <tr><td colspan='2' style='border: 1px solid #ccc; padding: 6px; font-weight:bold;'>평상시</td><td style='border: 1px solid #ccc;'>활동 ≥ 1.2, 전도 ≥ 1.2, 허용지지력 ≤ {qa_n} kPa</td></tr>
-<tr><td colspan='2' style='border: 1px solid #ccc; padding: 6px; font-weight:bold;'>지진시</td><td style='border: 1px solid #ccc;'>활동 ≥ 1.1, 전도 ≥ 1.1, 허용지지력 ≤ {qa_s} kPa</td></tr>
+<tr><td colspan='2' style='border: 1px solid #ccc; padding: 6px; font-weight:bold;'>지진시</td><td style='border: 1px solid #ccc;'>활동 ≥ 1.0, 전도 ≥ 1.0, 허용지지력 ≤ {qa_s} kPa</td></tr>
 </table>
 </div>
 """
@@ -2812,9 +2644,7 @@ else:
     o_html(generate_water_pressure_html(edited_tiers, hwl_n, llw, rwl_n, c_top, g_w))
 
     o_title("5. 상재하중 (연직력 작용)", level=1)
-    o_html(generate_surcharge_html(edited_tiers, q_s, c_top, tier_details=tier_details))
-    # 혹은 본문 코드에서 쓰는 변수명이 tiers_details 라면:
-    # o_html(generate_surcharge_html(edited_tiers, q_s, c_top, tier_details=tiers_details))
+    o_html(generate_surcharge_html(edited_tiers, q_s, c_top))
 
     o_title("6. 지진시 동토압 상세", level=1)
 
@@ -3049,14 +2879,27 @@ else:
         ("CASE 2-4", "2_4")
     ]
 
-    o_html(generate_sliding_table(cases_list_eq, tier_details, fs_allow=1.1, mu_cc=0.5, mu_cb=0.6))
-    o_html(generate_overturning_table(cases_list_eq, tier_details, fs_allow=1.1))
+    o_html(generate_sliding_table(cases_list_eq, tier_details, fs_allow=1.0, mu_cc=0.5, mu_cb=0.6))
+    o_html(generate_overturning_table(cases_list_eq, tier_details, fs_allow=1.0))
 
     bottom_tier_detail = tier_details[-1]
     o_html(generate_bearing_table(cases_list_eq, bottom_tier_detail, qa_allow=qa_s, mu=0.6))
 
-# (기존 다운로드 버튼 코드 유지)
+# =====================================================================
+# ★ 10. 통합 보고서 다운로드 렌더링
+# =====================================================================
+def render_fast_download(rep_obj, filename_base):
+    st.divider()
+    st.header("🖨️ 종합 구조계산서 다운로드")
+    st.info("💡 **초고속 병렬 다운로드 엔진 적용:** HTML 웹용 및 MS Word용 보고서를 즉시 생성합니다.")
+    with st.spinner("보고서용 수식과 그림을 변환 중입니다..."):
+        report_html = rep_obj.get_html()
+        mhtml_data = rep_obj.get_mhtml()
+    col1, col2 = st.columns(2)
+    with col1:
+        st.download_button("📄 구조계산서 다운로드 (HTML웹용)", data=report_html.encode('utf-8'), file_name=f"{filename_base}.html", mime="text/html", use_container_width=True)
+    with col2:
+        st.download_button("📝 구조계산서 다운로드 (MS Word용)", data=mhtml_data.encode('utf-8'), file_name=f"{filename_base}.doc", mime="application/msword", use_container_width=True)
 
-st.divider()
-st.download_button(label="📄 엑셀 완벽 대응 상세 구조계산서 다운로드 (.html)", data=rep.get_html(),
-                   file_name=f"구조계산서_{'평상시' if '평상시' in calc_mode else '지진시'}.html", mime="text/html")
+filename_suffix = "평상시" if "평상시" in calc_mode else "지진시"
+render_fast_download(rep, f"블록식_안벽_구조계산서_{filename_suffix}")
