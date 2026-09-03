@@ -2,10 +2,14 @@ import streamlit as st
 import math
 import os
 import urllib.request
+import urllib.parse
 import matplotlib.pyplot as plt
 import matplotlib.font_manager as fm
 import base64
 import re
+import io               # 👈 이 줄을 추가해 주세요!
+import concurrent.futures
+import textwrap
 
 # =====================================================================
 # ★ 한글 폰트 깨짐 방지
@@ -33,6 +37,103 @@ def get_image_base64(filepath):
     except FileNotFoundError:
         return ""
 
+@st.cache_data(show_spinner=False)
+def fetch_equation_image(api_url):
+    try:
+        req = urllib.request.Request(api_url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=5) as response:
+            return base64.b64encode(response.read()).decode('utf-8')
+    except Exception:
+        return None
+
+@st.cache_data(show_spinner=False)
+def convert_html_to_mhtml(html_content):
+    word_html = html_content
+    attachments = {}
+    counters = {'img': 0, 'eq': 0}
+
+    word_html = re.sub(r'<script.*?</script>', '', word_html, flags=re.DOTALL)
+
+    # Base64 이미지를 찾아 CID 포맷으로 변환
+    def image_replacer(match):
+        b64_data = match.group(1)
+        counters['img'] += 1
+        img_id = f"embedded_img_{counters['img']}"
+        attachments[img_id] = b64_data
+        return f'<img src="cid:{img_id}" width="650">'
+    
+    word_html = re.sub(r'src=["\']data:image/[a-zA-Z]+;base64,([^\'"]+)["\']', image_replacer, word_html)
+
+    display_maths = re.findall(r'\$\$(.*?)\$\$', word_html, flags=re.DOTALL)
+    inline_maths = re.findall(r'\$([^\$]+)\$', word_html)
+    urls_to_fetch = set()
+    
+    def prepare_url(eq_text, is_display):
+        eq_c = re.sub(r'\\text\{([^}]+)\}', lambda m: "" if re.search(r'[가-힣]', m.group(1)) else m.group(0), eq_text)
+        eq_c = eq_c.replace(r'\max', 'max').replace(r'\min', 'min').replace(r'\mathbf', '')
+        dpi = "110" if is_display else "100"
+        return f"https://latex.codecogs.com/png.image?\\dpi{{{dpi}}}\\bg_white&space;{urllib.parse.quote(eq_c)}"
+    
+    for eq in display_maths: urls_to_fetch.add(prepare_url(eq.strip(), True))
+    for eq in inline_maths:
+        txt = eq.strip()
+        if any(op in txt for op in ["\\", "=", "+", "-", "/", "times", "ge", "le", "<", ">", "^", "_"]):
+            urls_to_fetch.add(prepare_url(txt, False))
+            
+    with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
+        list(executor.map(fetch_equation_image, urls_to_fetch))
+
+    def render_math_to_img(eq_text, is_display):
+        korean_parts = []
+        def kr_replacer(m):
+            txt = m.group(1)
+            if re.search(r'[가-힣]', txt):
+                korean_parts.append(txt)
+                return ""
+            return m.group(0)
+        eq_c = re.sub(r'\\text\{([^}]+)\}', kr_replacer, eq_text)
+        eq_c = eq_c.replace(r'\max', 'max').replace(r'\min', 'min').replace(r'\mathbf', '')
+        
+        api_url = prepare_url(eq_text, is_display)
+        counters['eq'] += 1
+        img_id = f"eq_img_{counters['eq']}"
+        b64_img = fetch_equation_image(api_url)
+        
+        if b64_img:
+            attachments[img_id] = b64_img
+            img_tag = f"<img src='cid:{img_id}' style='vertical-align: middle; border: none; max-width: 100%;'>"
+        else:
+            img_tag = f"<img src='{api_url}' style='vertical-align: middle; border: none; max-width: 100%;'>"
+        
+        kr_addon = f"<span style='margin-left:5px; font-weight:bold; color:#555;'>[{' '.join(korean_parts)}]</span>" if korean_parts else ""
+        return img_tag, kr_addon
+
+    def display_math_replacer(match):
+        img_tag, kr_addon = render_math_to_img(match.group(1).strip(), True)
+        return f'<table align="center" style="border-collapse: collapse; border: none; margin: 10px auto; width: 100%;"><tr><td style="border: none; padding: 0; text-align: center;">{img_tag} {kr_addon}</td></tr></table>'
+    word_html = re.sub(r'\$\$(.*?)\$\$', display_math_replacer, word_html, flags=re.DOTALL)
+
+    def inline_math_replacer(match):
+        eq_text = match.group(1).strip()
+        if any(op in eq_text for op in ["\\", "=", "+", "-", "/", "times", "ge", "le", "<", ">", "^", "_"]):
+            img_tag, kr_addon = render_math_to_img(eq_text, False)
+            return f"{img_tag}{kr_addon}"
+        else:
+            return f"${eq_text}$"
+    word_html = re.sub(r'\$([^\$]+)\$', inline_math_replacer, word_html)
+    word_html = re.sub(r'\$([a-zA-Z]+)_([a-zA-Z0-9\+\-]+)\$', r'\1<sub>\2</sub>', word_html)
+    word_html = word_html.replace('$', '')
+
+    boundary = "----=_NextPart_HTML_DOC_001"
+    mhtml = f'MIME-Version: 1.0\nContent-Type: multipart/related; type="text/html"; boundary="{boundary}"\n\n'
+    mhtml += f'--{boundary}\nContent-Type: text/html; charset="utf-8"\nContent-Transfer-Encoding: 8bit\n\n'
+    mhtml += word_html + "\n\n"
+    
+    for cid, b64 in attachments.items():
+        formatted_b64 = '\n'.join(textwrap.wrap(b64, 76))
+        mhtml += f'--{boundary}\nContent-Type: image/png\nContent-Transfer-Encoding: base64\nContent-ID: <{cid}>\n\n{formatted_b64}\n\n'
+    mhtml += f"--{boundary}--\n"
+    return mhtml
 # =====================================================================
 # ★ 공학 계산 엔진
 # =====================================================================
@@ -227,7 +328,7 @@ with st.sidebar:
     st.header("⚙️ 설계 방법 선택")
     design_method = st.radio("방법 분기", ["결정론적 설계법", "신뢰성 설계법"], label_visibility="collapsed")
     st.markdown("---")
-    st.write("**제작:** [다온기술(주), 김창보, 오창현, 이근형, 정현재]")
+    st.write("**제작:** [다온기술(주), 김창보, 이종태]")
     st.write("**기반:** [혼성제 사석부 피복재 안정질량 산정 시스템]")
     st.markdown("---")
 
@@ -469,7 +570,8 @@ if design_method == "결정론적 설계법":
                 st.error(f"데이터 처리 중 오류 발생: {e}")
                 Ns3_val = st.number_input("도표에서 독취한 안정계수 Ns³", value=22.0, step=1.0)
     
-            # 도표 시각화 
+            # 도표 시각화 및 보고서 삽입용 이미지 저장
+            brebner_dynamic_img_base64 = ""
             if 'df_clean' in locals() and not df_clean.empty:
                 fig, ax = plt.subplots(figsize=(2.4, 3.6))
                 
@@ -507,6 +609,14 @@ if design_method == "결정론적 설계법":
                 
                 plt.tight_layout()
                 st.pyplot(fig)
+                
+                # ▼▼▼ 보고서에 그래프를 넣기 위한 추가 코드 ▼▼▼
+                buf = io.BytesIO()
+                fig.savefig(buf, format='png', bbox_inches='tight', dpi=150)
+                buf.seek(0)
+                encoded_fig = base64.b64encode(buf.read()).decode('utf-8')
+                brebner_dynamic_img_base64 = f"data:image/png;base64,{encoded_fig}"
+                # ▲▲▲ 추가 완료 ▲▲▲
 
     st.markdown("---")
 
@@ -640,10 +750,14 @@ if design_method == "결정론적 설계법":
         warning_msg = "<div class='warning-box'>⚠️ 상대여유고가 0.6 &lt; R &lt; 1.0 구간에 해당하므로 수리모형실험 수행이 권장되나, 본 연산에서는 사석부의 구조적 안정성 확보 측면을 고려하여 고여유고(R &ge; 1.0) 보정계수 기준을 연계 설계치로 보수적 적용하였습니다.</div>"
 
     formula_str_escaped = formula_str.replace("\\", "\\\\")
+    
+    # ▼▼▼ 변수 추가 ▼▼▼
+    dynamic_img_tag = f'<img src="{brebner_dynamic_img_base64}" alt="Brebner 자동 독취 결과 그래프" style="max-width: 400px; display: block; margin: 20px auto;">' if brebner_dynamic_img_base64 else ""
 
     full_html_report = f"""
     <!DOCTYPE html>
     <html>
+
     <head>
         <meta charset="utf-8">
         <title>혼성제 사석부 피복재 안정질량 산정 보고서</title>
@@ -821,21 +935,40 @@ if design_method == "결정론적 설계법":
         <h3>다. Brebner & Donnelly 식 상세 연산</h3>
         <p><b>Step 1: 수심비 기반 계수 자동 독취 적용</b></p>
         <p>수심비 d<sub>1</sub>/d<sub>s</sub> = {d_1:.2f} / {hs:.2f} = {depth_ratio:.3f} 조건에 대하여 데이터 보간을 통해 산출된 최소 안정계수 N<sub>s</sub><sup>3</sup> = {Ns3_val:.2f}</p>
+        
+        <!-- ▼▼▼ 방금 만든 그래프 이미지 태그 삽입 ▼▼▼ -->
+        {dynamic_img_tag}
+
         <p><b>Step 2: 소요질량 산정</b></p>
+
         <div class="eq">$$ M = \\frac{{{gamma_rock:.2f} \\times {Hs}^3}}{{{Ns3_val:.2f} \\times ({Sr:.3f} - 1)^3}} = {M_breb:,.2f} \\text{{ kN}} \\quad (V = {V_breb:.3f} \\text{{ m}}^3) $$</div>
 
     </body>
     </html>
     """
 
-    st.download_button(
-        label="💾 현재 화면 전체 보고서 다운로드 (.html)",
-        data=full_html_report.encode('utf-8'),
-        file_name="혼성제_사석부_피복재_안정질량_통합보고서.html",
-        mime="text/html",
-        help="클릭하시면 현재 화면에 표출된 공식, 이미지 단면도, 비교표 및 풀이 과정이 모두 포함된 HTML 보고서를 저장합니다.",
-        use_container_width=True
-    )
+    with st.spinner("Word 문서 수식 변환 중입니다..."):
+        mhtml_report = convert_html_to_mhtml(full_html_report)
+
+    st.divider()
+    col_d1, col_d2 = st.columns(2)
+    with col_d1:
+        st.download_button(
+            label="📄 종합 보고서 다운로드 (HTML웹용)",
+            data=full_html_report.encode('utf-8'),
+            file_name="혼성제_사석부_피복재_결정론적_통합보고서.html",
+            mime="text/html",
+            use_container_width=True
+        )
+    with col_d2:
+        st.download_button(
+            label="📝 종합 보고서 다운로드 (MS Word용)",
+            data=mhtml_report.encode('utf-8'),
+            file_name="혼성제_사석부_피복재_결정론적_통합보고서.doc",
+            mime="application/msword",
+            use_container_width=True
+        )
+
 # =====================================================================
 # ★ 분기 2: 신뢰성 설계법 (확장 다니모토 보정식 독립 실행)
 # =====================================================================
@@ -1005,10 +1138,24 @@ else:
     </html>
     """
     
-    st.download_button(
-        label="💾 현재 화면 전체 보고서 다운로드 (.html)",
-        data=full_html_report_rel.encode('utf-8'),
-        file_name="혼성제_사석부_피복재_신뢰성설계_통합보고서.html",
-        mime="text/html",
-        use_container_width=True
-    )
+    with st.spinner("Word 문서 수식 변환 중입니다..."):
+        mhtml_report_rel = convert_html_to_mhtml(full_html_report_rel)
+
+    st.divider()
+    col_d3, col_d4 = st.columns(2)
+    with col_d3:
+        st.download_button(
+            label="📄 종합 보고서 다운로드 (HTML웹용)",
+            data=full_html_report_rel.encode('utf-8'),
+            file_name="혼성제_사석부_피복재_신뢰성설계_통합보고서.html",
+            mime="text/html",
+            use_container_width=True
+        )
+    with col_d4:
+        st.download_button(
+            label="📝 종합 보고서 다운로드 (MS Word용)",
+            data=mhtml_report_rel.encode('utf-8'),
+            file_name="혼성제_사석부_피복재_신뢰성설계_통합보고서.doc",
+            mime="application/msword",
+            use_container_width=True
+        )
