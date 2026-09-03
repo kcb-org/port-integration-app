@@ -710,12 +710,22 @@ with st.sidebar:
     st.header("5. TTP 외 소파블록(기타 블록) 파라미터")
     gamma_other = st.number_input("단위중량 γ (kN/m³) [기타 블록]", value=22.6, step=0.1)
     Kd_other = st.number_input("안정계수 KD [기타 블록]", value=10.0, step=0.1)
+
     st.info("💡 기타 소파블록은 입력하신 KD 값을 바탕으로 **Hudson 공식**으로만 중량을 산출합니다.")
     st.markdown("---")
     
+    # 1. 계산 완료 상태를 기억할 세션 변수 초기화
+    if 'armor_calculated' not in st.session_state:
+        st.session_state['armor_calculated'] = False
+        
     run_button = st.button("🚀 검토 실행 (Calculate)", type="primary", use_container_width=True)
+    
+    # 2. 버튼이 눌리면 계산 완료 상태로 기록
+    if run_button:
+        st.session_state['armor_calculated'] = True
 
-if run_button:
+# 3. 버튼 클릭 여부가 아닌 계산 완료 상태를 기준으로 화면 유지
+if st.session_state['armor_calculated']:
     calc = ArmorCalculator()
     rep = ReportBuilder(title_text=f"피복재 및 소파블록 통합 검토 ({design_method})")
     
@@ -1099,16 +1109,171 @@ if run_button:
     rep.custom_html("<hr>")
 
     # ====================================================
-    # 다운로드 버튼
+    # 다운로드 버튼 (HTML & MS Word 동시 지원 + 초고속 렌더링)
     # ====================================================
     st.divider()
-    st.download_button(
-        label="📄 통합 산정 보고서 다운로드 (.html)",
-        data=rep.get_html().encode('utf-8'),
-        file_name=f"피복재_통합산정보고서({design_method}).html",
-        mime="text/html",
-        use_container_width=True
-    )
+    st.header("🖨️ 상세 계산 보고서 다운로드")
+    st.info("💡 **HTML 출력:** 브라우저에서 '인쇄(Ctrl+P)' 기능을 통해 PDF로 저장하기 좋습니다.\n\n💡 **Word 출력:** 수식을 문서 내부에 고해상도 이미지로 직접 박제하며, 멀티스레딩(Multi-threading) 기술을 적용해 생성 속도를 비약적으로 단축했습니다.")
+
+    # API 호출 속도 향상 및 중복 다운로드 방지용 캐싱
+    @st.cache_data(show_spinner=False)
+    def fetch_equation_image(api_url):
+        import urllib.request
+        import base64
+        try:
+            req = urllib.request.Request(api_url, headers={'User-Agent': 'Mozilla/5.0'})
+            with urllib.request.urlopen(req, timeout=5) as response:
+                return base64.b64encode(response.read()).decode('utf-8')
+        except Exception:
+            return None
+
+    with st.spinner("Word 보고서를 위한 수식 및 그래프를 고속 변환 중입니다. 잠시만 기다려주세요..."):
+        report_html = rep.get_html()
+        
+        import urllib.parse
+        import urllib.request
+        import concurrent.futures
+        import re
+        import base64
+        
+        word_html = report_html
+        attachments = {}
+        counters = {'img': 0, 'eq': 0}
+
+        # MathJax 스크립트 삭제
+        word_html = re.sub(r'<script.*?</script>', '', word_html, flags=re.DOTALL)
+
+        # 표(Table) 테두리 강제 설정
+        word_html = word_html.replace('<table', '<table style="border-collapse: collapse; width: 100%; border: 1px solid black; margin-bottom: 20px;"')
+        word_html = word_html.replace('<th>', '<th style="border: 1px solid black; padding: 8px; background-color: #f2f2f2; text-align: center;">')
+        word_html = word_html.replace('<td>', '<td style="border: 1px solid black; padding: 8px; text-align: center;">')
+
+        # HTML 내 <img> 태그(base64 데이터) 추출 및 CID 치환
+        def image_replacer(match):
+            b64_data = match.group(1)
+            counters['img'] += 1
+            img_id = f"fig_img_{counters['img']}"
+            attachments[img_id] = b64_data
+            return f'src="cid:{img_id}" style="max-width: 100%; height: auto;"'
+            
+        word_html = re.sub(r'src=[\'"]data:image/png;base64,([^\'"]+)[\'"]', image_replacer, word_html)
+
+        # --- 🚀 초고속 병렬 다운로드 준비 ---
+        display_maths = re.findall(r'\$\$(.*?)\$\$', word_html, flags=re.DOTALL)
+        inline_maths = re.findall(r'\$([^\$]+)\$', word_html)
+        
+        urls_to_fetch = set()
+        
+        def prepare_url(eq_text, is_display):
+            eq_clean = re.sub(r'\\text\{([^}]+)\}', lambda m: "" if re.search(r'[가-힣]', m.group(1)) else m.group(0), eq_text)
+            eq_clean = eq_clean.replace(r'\max', 'max').replace(r'\min', 'min').replace(r'\mathbf', '')
+            dpi = "110" if is_display else "100"
+            return f"https://latex.codecogs.com/png.image?\\dpi{{{dpi}}}\\bg_white&space;{urllib.parse.quote(eq_clean)}"
+        
+        for eq in display_maths:
+            urls_to_fetch.add(prepare_url(eq.strip(), True))
+            
+        for eq in inline_maths:
+            txt = eq.strip()
+            if any(op in txt for op in ["\\", "=", "+", "-", "/", "times", "ge", "le", "<", ">"]):
+                urls_to_fetch.add(prepare_url(txt, False))
+                
+        # 다중 스레드로 수식 이미지 일괄 다운로드
+        with concurrent.futures.ThreadPoolExecutor(max_workers=15) as executor:
+            list(executor.map(fetch_equation_image, urls_to_fetch))
+
+        # --- 수식 이미지 치환 ---
+        def render_math_to_img(eq_text, is_display):
+            korean_parts = []
+            def kr_replacer(m):
+                txt = m.group(1)
+                if re.search(r'[가-힣]', txt):
+                    korean_parts.append(txt)
+                    return ""
+                return m.group(0)
+                
+            eq_clean = re.sub(r'\\text\{([^}]+)\}', kr_replacer, eq_text)
+            eq_clean = eq_clean.replace(r'\max', 'max').replace(r'\min', 'min').replace(r'\mathbf', '')
+            
+            eq_url = urllib.parse.quote(eq_clean)
+            dpi = "110" if is_display else "100"
+            api_url = f"https://latex.codecogs.com/png.image?\\dpi{{{dpi}}}\\bg_white&space;{eq_url}"
+            
+            counters['eq'] += 1
+            img_id = f"eq_img_{counters['eq']}"
+            
+            b64_img = fetch_equation_image(api_url)
+            
+            if b64_img:
+                attachments[img_id] = b64_img
+                img_tag = f"<img src='cid:{img_id}' style='vertical-align: middle; border: none; max-width: 100%;'>"
+            else:
+                img_tag = f"<img src='{api_url}' style='vertical-align: middle; border: none; max-width: 100%;'>"
+            
+            kr_addon = f"<span style='margin-left:5px; font-weight:bold; color:#555;'>[{' '.join(korean_parts)}]</span>" if korean_parts else ""
+            return img_tag, kr_addon
+
+        def display_math_replacer(match):
+            img_tag, kr_addon = render_math_to_img(match.group(1).strip(), True)
+            return f'''
+            <table align="center" style="border-collapse: collapse; border: none; margin: 10px auto; width: 100%;">
+                <tr><td style="border: none; padding: 0; text-align: center;">{img_tag} {kr_addon}</td></tr>
+            </table>
+            '''
+            
+        word_html = re.sub(r'\$\$(.*?)\$\$', display_math_replacer, word_html, flags=re.DOTALL)
+
+        def inline_math_replacer(match):
+            eq_text = match.group(1).strip()
+            if any(op in eq_text for op in ["\\", "=", "+", "-", "/", "times", "ge", "le", "<", ">"]):
+                img_tag, kr_addon = render_math_to_img(eq_text, False)
+                return f"{img_tag}{kr_addon}"
+            else:
+                return f"${eq_text}$"
+                
+        word_html = re.sub(r'\$([^\$]+)\$', inline_math_replacer, word_html)
+
+        # 잔여 기호 Word 호환 HTML 첨자 변환
+        word_html = word_html.replace("$H_{1/3}$", "H<sub>1/3</sub>").replace("$T_z$", "T<sub>z</sub>").replace("$h_{1/3, peak}$", "h<sub>1/3, peak</sub>")
+        word_html = word_html.replace("$H_0'$", "H<sub>0</sub>'").replace("$H_s$", "H<sub>s</sub>").replace("$T_{1/3}$", "T<sub>1/3</sub>")
+        word_html = word_html.replace("$\\gamma_R$", "γ<sub>R</sub>").replace("$\\gamma_S$", "γ<sub>S</sub>").replace("$\\gamma_m$", "γ<sub>m</sub>")
+        word_html = word_html.replace("$\\Delta$", "Δ").replace("$\\xi_m$", "ξ<sub>m</sub>").replace("$\\xi_{mc}$", "ξ<sub>mc</sub>")
+        word_html = word_html.replace("$\\alpha$", "α").replace("$S_r$", "S<sub>r</sub>").replace("$K_D$", "K<sub>D</sub>")
+        word_html = word_html.replace("$L_0$", "L<sub>0</sub>").replace("$K_s$", "K<sub>s</sub>").replace("$H_b$", "H<sub>b</sub>")
+        word_html = word_html.replace("$d_{b,max}$", "d<sub>b,max</sub>").replace("$d_{b,min}$", "d<sub>b,min</sub>")
+        word_html = re.sub(r'\$([a-zA-Z]+)_([a-zA-Z0-9\+\-]+)\$', r'\1<sub>\2</sub>', word_html)
+        word_html = word_html.replace('$', '')
+
+        # --- MHTML 패키징 ---
+        boundary = "----=_NextPart_HTML_DOC_001"
+        mhtml = f'MIME-Version: 1.0\nContent-Type: multipart/related; type="text/html"; boundary="{boundary}"\n\n'
+        mhtml += f'--{boundary}\nContent-Type: text/html; charset="utf-8"\nContent-Transfer-Encoding: 8bit\n\n'
+        mhtml += word_html + "\n\n"
+        
+        for cid, b64 in attachments.items():
+            mhtml += f'--{boundary}\nContent-Type: image/png\nContent-Transfer-Encoding: base64\nContent-ID: <{cid}>\n\n{b64}\n\n'
+        mhtml += f"--{boundary}--\n"
+
+    # --- 3. 버튼 레이아웃 구성 ---
+    col_btn1, col_btn2 = st.columns(2)
+    
+    with col_btn1:
+        st.download_button(
+            label="📄 통합 산정 보고서 다운로드 (HTML 웹용)",
+            data=report_html.encode('utf-8'),
+            file_name=f"피복재_통합산정보고서({design_method}).html",
+            mime="text/html",
+            use_container_width=True
+        )
+        
+    with col_btn2:
+        st.download_button(
+            label="📝 통합 산정 보고서 다운로드 (MS Word용)",
+            data=mhtml.encode('utf-8'),
+            file_name=f"피복재_통합산정보고서({design_method}).doc",
+            mime="application/msword",
+            use_container_width=True
+        )
 
 else:
     st.info("👈 좌측 사이드바에 제원을 입력하고 **검토 실행** 버튼을 눌러주세요.")
