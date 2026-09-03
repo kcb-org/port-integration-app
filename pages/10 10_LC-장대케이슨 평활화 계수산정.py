@@ -5,6 +5,11 @@ import urllib.request
 import matplotlib.pyplot as plt
 import matplotlib.font_manager as fm
 import base64
+import io
+import re
+import urllib.parse
+import concurrent.futures
+import textwrap
 
 with st.sidebar:
     st.markdown("---")
@@ -386,12 +391,12 @@ st.markdown(r"3. **회전 안전율($SF_R$) 산정**: 회전 모멘트에 대한
 st.divider()
 
 # =====================================================================
-# 보고서 다운로드용 HTML 생성 (이미지 인코딩 및 서식 정렬)
+# 보고서 다운로드용 HTML 생성 (Raw f-string 적용 및 신뢰성 보완)
 # =====================================================================
 img_smooth_base64 = get_image_base64("파력의 평활화 효과.png")
 img_pressure_base64 = get_image_base64("설계파압 분포도.png")
 
-html_report_smoothing = f"""
+html_report_smoothing = rf"""
 <!DOCTYPE html>
 <html>
 <head>
@@ -432,28 +437,28 @@ html_report_smoothing = f"""
     <img src="{img_smooth_base64}" alt="파력 평활화 효과 개념도" class="concept-img">
     
     <ul>
-        <li>케이슨의 투영 길이($l_B \\sin\\theta$)와 파장($L$)의 비가 클수록 파력 저감 효과가 커집니다.</li>
-        <li>수직 직각 입사파보다는 입사각($\\theta$)이 큰 경사 입사파에서 효과가 뚜렷합니다.</li>
+        <li>케이슨의 투영 길이($l_B \sin\theta$)와 파장($L$)의 비가 클수록 파력 저감 효과가 커집니다.</li>
+        <li>수직 직각 입사파보다는 입사각($\theta$)이 큰 경사 입사파에서 효과가 뚜렷합니다.</li>
         <li>파형의 피크가 날카롭고 솟아 있는 쇄파나 충격파 형태일 때 평활화 효과가 큽니다.</li>
     </ul>
 
-    <h2>2. 평활화 계수($\\delta_B$) 산정식 및 장대케이슨 설계 절차</h2>
+    <h2>2. 평활화 계수($\delta_B$) 산정식 및 장대케이슨 설계 절차</h2>
     <h3>가. 평활화 계수 산정 공식</h3>
-    <p>일본 고다(Goda)식의 중복파압 성분($\\alpha_1$)과 충격파압 성분($\\alpha_2$)에 각각 다른 평활화 계수를 적용합니다.</p>
+    <p>일본 고다(Goda)식의 중복파압 성분($\alpha_1$)과 충격파압 성분($\alpha_2$)에 각각 다른 평활화 계수를 적용합니다.</p>
     
-    <div class="eq">$$ \\delta_{{B1}} = \\frac{{\\sin(\\pi \\cdot l_B \\sin\\theta / L)}}{{\\pi \\cdot l_B \\sin\\theta / L}} \\quad (\\alpha_1\\text{{항의 평활화계수}}) $$</div>
-    <div class="eq">$$ \\delta_{{B2}} = \\begin{{cases}} \\frac{{L}}{{40 \\cdot l_B \\sin\\theta}} & \\left(\\frac{{l_B \\sin\\theta}}{{L}} \\ge \\frac{{1}}{{20}}\\right) \\\\ 1.0 - 10 \\left( \\frac{{l_B \\sin\\theta}}{{L}} \\right) & \\left(\\frac{{l_B \\sin\\theta}}{{L}} < \\frac{{1}}{{20}}\\right) \\end{{cases}} \\quad (\\alpha_2\\text{{항의 평활화계수}}) $$</div>
-    <div class="eq">$$ \\gamma = \\frac{{\\alpha_2 \\cos^2\\theta}}{{\\alpha_1}} \\quad (\\text{{가중치}}) $$</div>
-    <div class="eq">$$ \\delta_B = \\frac{{\\delta_{{B1}} + \\gamma \\delta_{{B2}}}}{{1 + \\gamma}} \\quad (\\text{{수평파력 최종 평활화계수}}) $$</div>
-    <div class="eq">$$ \\delta_{{BU}} = \\delta_{{B1}} \\quad (\\text{{양압력 최종 평활화계수}}) $$</div>
+    <div class="eq">$$ \delta_{{B1}} = \frac{{\sin(\pi \cdot l_B \sin\theta / L)}}{{\pi \cdot l_B \sin\theta / L}} \quad (\alpha_1\text{{항의 평활화계수}}) $$</div>
+    <div class="eq">$$ \delta_{{B2}} = \begin{{cases}} \frac{{L}}{{40 \cdot l_B \sin\theta}} & \left(\frac{{l_B \sin\theta}}{{L}} \ge \frac{{1}}{{20}}\right) \\ 1.0 - 10 \left( \frac{{l_B \sin\theta}}{{L}} \right) & \left(\frac{{l_B \sin\theta}}{{L}} < \frac{{1}}{{20}}\right) \end{{cases}} \quad (\alpha_2\text{{항의 평활화계수}}) $$</div>
+    <div class="eq">$$ \gamma = \frac{{\alpha_2 \cos^2\theta}}{{\alpha_1}} \quad (\text{{가중치}}) $$</div>
+    <div class="eq">$$ \delta_B = \frac{{\delta_{{B1}} + \gamma \delta_{{B2}}}}{{1 + \gamma}} \quad (\text{{수평파력 최종 평활화계수}}) $$</div>
+    <div class="eq">$$ \delta_{{BU}} = \delta_{{B1}} \quad (\text{{양압력 최종 평활화계수}}) $$</div>
 
     <h3>나. 장대케이슨 내파 안정성 설계 절차</h3>
     <ol>
         <li><b>초기 파력 계산</b>: 통상의 고다식을 이용하여 단위 길이당 수평파력($P_G$)과 양압력($U_G$) 계산</li>
         <li><b>평활화 계수 산정</b>: 케이슨 길이와 파랑 조건을 고려하여 $\delta_B$, $\delta_{{BU}}$ 도출</li>
-        <li><b>설계 파력 적용</b>: 평활화 효과가 반영된 실제 작용 수평파력($P_o = \delta_B \\cdot P_G$)과 양압력($U_o = \delta_{{BU}} \\cdot U_G$) 계산</li>
-        <li><b>활동(Sliding) 안정성 검토</b>: $SF_S = \\frac{{\\mu(\\omega' - U_o)}}{{P_o}} \\ge 1.2$ 검토</li>
-        <li><b>회전(Rotation) 안정성 검토</b>: 편심된 파력 분포로 인한 회전 안전율($SF_R \\ge 1.0$) 검토 (단, $(l_B\\sin\\theta)/L \\le 0.5$ 이면 생략 가능)</li>
+        <li><b>설계 파력 적용</b>: 평활화 효과가 반영된 실제 작용 수평파력($P_o = \delta_B \cdot P_G$)과 양압력($U_o = \delta_{{BU}} \cdot U_G$) 계산</li>
+        <li><b>활동(Sliding) 안정성 검토</b>: $SF_S = \frac{{\mu(\omega' - U_o)}}{{P_o}} \ge 1.2$ 검토</li>
+        <li><b>회전(Rotation) 안정성 검토</b>: 편심된 파력 분포로 인한 회전 안전율($SF_R \ge 1.0$) 검토 (단, $(l_B\sin\theta)/L \le 0.5$ 이면 생략 가능)</li>
     </ol>
 
     <h2>3. 자동 산정 결과 요약표</h2>
@@ -463,44 +468,195 @@ html_report_smoothing = f"""
     <img src="{img_pressure_base64}" alt="설계파압 분포도" class="concept-img">
     
     <p><b>Step 1: 천해파 파장 산정 (시산법)</b></p>
-    <div class="eq">$$ L_0 = \\frac{{9.81 \\times {T}^2}}{{2\\pi}} = {L0_h:.2f} \\text{{ m}} $$</div>
-    <div class="eq">$$ \\text{{수심 }} {h}\\text{{m 최종 수렴 }} L = {L:.2f} \\text{{ m}} $$</div>
+    <div class="eq">$$ L_0 = \frac{{9.81 \times {T}^2}}{{2\pi}} = {L0_h:.2f} \text{{ m}} $$</div>
+    <div class="eq">$$ \text{{수심 }} {h}\text{{m 최종 수렴 }} L = {L:.2f} \text{{ m}} $$</div>
     
     <p><b>Step 2: 고다(Goda) 파압계수 자동 산정</b></p>
-    <div class="eq">$$ \\alpha_1 = 0.6 + 0.5 \\left[ \\frac{{4\\pi \\times {h} / {L:.2f}}}{{\\sinh(4\\pi \\times {h} / {L:.2f})}} \\right]^2 = {alpha1:.3f} $$</div>
-    <div class="eq">$$ h_b = {h} + 5 \\times {H_13} \\times {slope} = {h_b:.3f} \\text{{ m}} $$</div>
-    <div class="eq">$$ \\alpha_2 = \\min \\left[ \\frac{{{h_b:.3f} - {d}}}{{3 \\times {h_b:.3f}}} \\left( \\frac{{{H_max}}}{{{d}}} \\right)^2, \\frac{{2 \\times {d}}}{{{H_max}}} \\right] = {alpha2:.3f} $$</div>
+    <div class="eq">$$ \alpha_1 = 0.6 + 0.5 \left[ \frac{{4\pi \times {h} / {L:.2f}}}{{\sinh(4\pi \times {h} / {L:.2f})}} \right]^2 = {alpha1:.3f} $$</div>
+    <div class="eq">$$ h_b = {h} + 5 \times {H_13} \times {slope} = {h_b:.3f} \text{{ m}} $$</div>
+    <div class="eq">$$ \alpha_2 = \min \left[ \frac{{{h_b:.3f} - {d}}}{{3 \times {h_b:.3f}}} \left( \frac{{{H_max}}}{{{d}}} \right)^2, \frac{{2 \times {d}}}{{{H_max}}} \right] = {alpha2:.3f} $$</div>
 
-    <p><b>Step 3: 평활화 투영 길이비 및 $\\alpha_1$ 항 계수($\delta_{{B1}}$)</b></p>
-    <div class="eq">$$ \\text{{상대길이비}} = \\frac{{{l_B} \\times \\sin({theta_deg}^\\circ)}}{{{L:.2f}}} = {ratio:.4f} $$</div>
-    <div class="eq">$$ \\delta_{{B1}} = \\frac{{\\sin(\\pi \\times {ratio:.4f})}}{{\\pi \\times {ratio:.4f}}} = {delta_B1:.4f} $$</div>
+    <p><b>Step 3: 평활화 투영 길이비 및 $\alpha_1$ 항 계수($\delta_{{B1}}$)</b></p>
+    <div class="eq">$$ \text{{상대길이비}} = \frac{{{l_B} \times \sin({theta_deg}^\circ)}}{{{L:.2f}}} = {ratio:.4f} $$</div>
+    <div class="eq">$$ \delta_{{B1}} = \frac{{\sin(\pi \times {ratio:.4f})}}{{\pi \times {ratio:.4f}}} = {delta_B1:.4f} $$</div>
     
-    <p><b>Step 4: $\\alpha_2$ 항 계수($\delta_{{B2}}$)</b></p>
-    <div class="eq">$$ \\delta_{{B2}} = {delta_B2:.4f} $$</div>
+    <p><b>Step 4: $\alpha_2$ 항 계수($\delta_{{B2}}$)</b></p>
+    <div class="eq">$$ \delta_{{B2}} = {delta_B2:.4f} $$</div>
 
-    <p><b>Step 5: 가중치($\\gamma$) 및 최종 평활화 계수($\delta_B$, $\delta_{{BU}}$)</b></p>
-    <div class="eq">$$ \\gamma = \\frac{{{alpha2:.3f} \\times \\cos^2({theta_deg}^\\circ)}}{{{alpha1:.3f}}} = {gamma:.4f} $$</div>
-    <div class="eq">$$ \\delta_B = \\frac{{{delta_B1:.4f} + {gamma:.4f} \\times {delta_B2:.4f}}}{{1 + {gamma:.4f}}} = {delta_B:.4f} $$</div>
-    <div class="eq">$$ \\delta_{{BU}} = \\delta_{{B1}} = {delta_BU:.4f} $$</div>
+    <p><b>Step 5: 가중치($\gamma$) 및 최종 평활화 계수($\delta_B$, $\delta_{{BU}}$)</b></p>
+    <div class="eq">$$ \gamma = \frac{{{alpha2:.3f} \times \cos^2({theta_deg}^\circ)}}{{{alpha1:.3f}}} = {gamma:.4f} $$</div>
+    <div class="eq">$$ \delta_B = \frac{{{delta_B1:.4f} + {gamma:.4f} \times {delta_B2:.4f}}}{{1 + {gamma:.4f}}} = {delta_B:.4f} $$</div>
+    <div class="eq">$$ \delta_{{BU}} = \delta_{{B1}} = {delta_BU:.4f} $$</div>
 
     <h2>5. 케이슨 법선방향 길이에 따른 평활화 효과 비교</h2>
     <table style="width:100%; border-collapse: collapse; text-align: center; font-size: 1.0em;" border="1">
         <tr style="background-color: #f1f8ff; color: #1e3a8a;">
             <th style="padding: 10px; border: 1px solid #ddd;">케이슨 길이 ($l_B$)</th>
-            <th style="padding: 10px; border: 1px solid #ddd;">투영 길이비 ($(l_B \sin\\theta)/L$)</th>
+            <th style="padding: 10px; border: 1px solid #ddd;">투영 길이비 ($(l_B \sin\theta)/L$)</th>
             <th style="padding: 10px; border: 1px solid #ddd;">수평파력 평활화 계수 ($\delta_B$)</th>
             <th style="padding: 10px; border: 1px solid #ddd;">양압력 평활화 계수 ($\delta_{{BU}}$)</th>
         </tr>
         {sensitivity_rows_for_report}
     </table>
+
+    <div style='background-color: #e8f0fe; border-left: 4px solid #1e3a8a; padding: 15px; margin-top: 20px; margin-bottom: 10px; border-radius: 4px;'>
+        <b>참고) 케이슨 투영 길이비와 내파 안정성 검토 기준 및 마이너스(-) 계수 처리</b>
+    </div>
+    <ul>
+        <li>$\frac{{l_B \sin\theta}}{{L}} \le 0.5$ 인 구간: 통상의 평면적 회전(Rotation) 검토를 간략화하거나 생략할 수 있습니다.</li>
+        <li>$\frac{{l_B \sin\theta}}{{L}} > 0.5$ 인 구간 (⚠️ 표시 구간): 케이슨 길이가 길어져 투영 길이비가 0.5를 초과하는 경우, 편심된 파력 분포에 따른 <b>평면적 회전 안정성 검토</b> 및 전면 수위가 $0.5H$ 저하될 때 작용하는 <b>부(-)의 파력(Negative Wave Force)</b> 영향을 반드시 정밀하게 추가 검토해야 합니다.</li>
+        <li><b>평활화 계수가 마이너스(-) 또는 다시 플러스(+)로 산정되는 현상 및 처리:</b>
+            <ul>
+                <li>케이슨 길이가 파장에 비해 매우 길어지면(투영 길이비가 $1.0$을 초과), 산정식의 사인($\sin$) 함수의 주기적 특성으로 인해 수학적으로 다시 플러스($+$) 값이 나타나거나 마이너스($-$) 값이 반복됩니다.</li>
+                <li>이는 물리적으로 파력의 저감 효과가 다시 발생하는 것이 아니라, <b>공식의 유효 범위(경호식 적용 한계)를 벗어난 수학적 결과</b>에 불과합니다.</li>
+                <li>따라서 <b>이상값이 발생하는 구간에서는 설계 파력이 왜곡되지 않도록 강제적으로 하한선인 $0$으로 클리핑(Clipping) 보정</b>하는 안전 장치를 적용하여 보수적으로 설계합니다.</li>
+            </ul>
+        </li>
+    </ul>
+
+    <div style='background-color: #e8f0fe; border-left: 4px solid #1e3a8a; padding: 15px; margin-top: 20px; margin-bottom: 10px; border-radius: 4px;'>
+        <b>🔍 장대케이슨의 '회전(Rotation)에 대한 안정성 검토' 방법</b>
+    </div>
+    <p>장대케이슨은 일반 케이슨과 달리 법선 방향으로 길기 때문에 파가 사각으로 입사할 때 케이슨 전체에 균일한 힘이 아니라 <b>시간차를 두고 편심된 분포 하중</b>이 작용합니다. 회전 안정성은 다음과 같은 절차로 검토합니다.</p>
+    <ol>
+        <li><b>시각별 회전중심(Pivot Point) 산정</b>: 파랑이 케이슨 길이를 따라 순차적으로 지나갈 때, 각 시점별로 작용하는 수평파력($P_o$)과 양압력($U_o$)의 분포로부터 케이슨 저면에서의 합력 작용점(편심 거리)을 계산합니다.</li>
+        <li><b>모멘트 평형 검토</b>: 케이슨의 자중(유효중량 $\omega'$)에 의한 복원 모멘트와 편심된 파력에 의한 전복/회전 모멘트를 비교합니다.</li>
+        <li><b>회전 안전율($SF_R$) 산정</b>: 회전 모멘트에 대한 복원 모멘트의 비가 설계 기준(통상 $SF_R \ge 1.0 \sim 1.2$ 이상)을 만족하는지 확인합니다.</li>
+    </ol>
 </body>
 </html>
 """
 
-st.download_button(
-    label="💾 현재 화면 전체 보고서 다운로드 (.html)",
-    data=html_report_smoothing.encode('utf-8'),
-    file_name="장대케이슨_파력평활화_자동산정_보고서.html",
-    mime="text/html",
-    use_container_width=True
-)
+# =====================================================================
+# ★ 초고속 수식 이미지 다운로드 캐시 및 MHTML 변환 엔진
+# =====================================================================
+@st.cache_data(show_spinner=False)
+def fetch_equation_image(api_url):
+    try:
+        req = urllib.request.Request(api_url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=5) as response:
+            return base64.b64encode(response.read()).decode('utf-8')
+    except Exception:
+        return None
+
+@st.cache_data(show_spinner=False)
+def convert_html_to_mhtml(html_content):
+    word_html = html_content
+    attachments = {}
+    counters = {'img': 0, 'eq': 0}
+
+    word_html = re.sub(r'<script.*?</script>', '', word_html, flags=re.DOTALL)
+    word_html = word_html.replace('<table', '<table style="border-collapse: collapse; width: 100%; border: 1px solid black; margin-bottom: 25px;"')
+    word_html = word_html.replace('<th>', '<th style="border: 1px solid black; padding: 8px; background-color: #f4f6f8; text-align: center;">')
+    word_html = word_html.replace('<td>', '<td style="border: 1px solid black; padding: 8px; text-align: center;">')
+
+    def image_replacer(match):
+        b64_data = match.group(1)
+        counters['img'] += 1
+        img_id = f"embedded_img_{counters['img']}"
+        attachments[img_id] = b64_data
+        return f'<img src="cid:{img_id}" style="max-width: 100%; height: auto;">'
+    
+    word_html = re.sub(r'src=["\']data:image/[a-zA-Z]+;base64,([^\'"]+)["\']', image_replacer, word_html)
+
+    display_maths = re.findall(r'\$\$(.*?)\$\$', word_html, flags=re.DOTALL)
+    inline_maths = re.findall(r'\$([^\$]+)\$', word_html)
+    urls_to_fetch = set()
+    
+    def prepare_url(eq_text, is_display):
+        eq_c = re.sub(r'\\text\{([^}]+)\}', lambda m: "" if re.search(r'[가-힣]', m.group(1)) else m.group(0), eq_text)
+        eq_c = eq_c.replace(r'\max', 'max').replace(r'\min', 'min').replace(r'\mathbf', '')
+        dpi = "110" if is_display else "100"
+        return f"https://latex.codecogs.com/png.image?\\dpi{{{dpi}}}\\bg_white&space;{urllib.parse.quote(eq_c)}"
+    
+    for eq in display_maths: urls_to_fetch.add(prepare_url(eq.strip(), True))
+    for eq in inline_maths:
+        txt = eq.strip()
+        if any(op in txt for op in ["\\", "=", "+", "-", "/", "times", "ge", "le", "<", ">", "^", "_"]):
+            urls_to_fetch.add(prepare_url(txt, False))
+            
+    with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
+        list(executor.map(fetch_equation_image, urls_to_fetch))
+
+    def render_math_to_img(eq_text, is_display):
+        korean_parts = []
+        def kr_replacer(m):
+            txt = m.group(1)
+            if re.search(r'[가-힣]', txt):
+                korean_parts.append(txt)
+                return ""
+            return m.group(0)
+        eq_c = re.sub(r'\\text\{([^}]+)\}', kr_replacer, eq_text)
+        eq_c = eq_c.replace(r'\max', 'max').replace(r'\min', 'min').replace(r'\mathbf', '')
+        
+        api_url = prepare_url(eq_text, is_display)
+        counters['eq'] += 1
+        img_id = f"eq_img_{counters['eq']}"
+        b64_img = fetch_equation_image(api_url)
+        
+        if b64_img:
+            attachments[img_id] = b64_img
+            img_tag = f"<img src='cid:{img_id}' style='vertical-align: middle; border: none; max-width: 100%;'>"
+        else:
+            img_tag = f"<img src='{api_url}' style='vertical-align: middle; border: none; max-width: 100%;'>"
+        
+        kr_addon = f"<span style='margin-left:5px; font-weight:bold; color:#555;'>[{' '.join(korean_parts)}]</span>" if korean_parts else ""
+        return img_tag, kr_addon
+
+    def display_math_replacer(match):
+        img_tag, kr_addon = render_math_to_img(match.group(1).strip(), True)
+        return f'<table align="center" style="border-collapse: collapse; border: none; margin: 10px auto; width: 100%;"><tr><td style="border: none; padding: 0; text-align: center;">{img_tag} {kr_addon}</td></tr></table>'
+    word_html = re.sub(r'\$\$(.*?)\$\$', display_math_replacer, word_html, flags=re.DOTALL)
+
+    def inline_math_replacer(match):
+        eq_text = match.group(1).strip()
+        if any(op in eq_text for op in ["\\", "=", "+", "-", "/", "times", "ge", "le", "<", ">", "^", "_"]):
+            img_tag, kr_addon = render_math_to_img(eq_text, False)
+            return f"{img_tag}{kr_addon}"
+        else:
+            return f"${eq_text}$"
+    word_html = re.sub(r'\$([^\$]+)\$', inline_math_replacer, word_html)
+    word_html = re.sub(r'\$([a-zA-Z]+)_([a-zA-Z0-9\+\-]+)\$', r'\1<sub>\2</sub>', word_html)
+    word_html = word_html.replace('$', '')
+
+    boundary = "----=_NextPart_HTML_DOC_001"
+    mhtml = f'MIME-Version: 1.0\nContent-Type: multipart/related; type="text/html"; boundary="{boundary}"\n\n'
+    mhtml += f'--{boundary}\nContent-Type: text/html; charset="utf-8"\nContent-Transfer-Encoding: 8bit\n\n'
+    
+    mhtml_body = word_html.replace("<html", "<html xmlns:o='urn:schemas-microsoft-com:office:office' xmlns:w='urn:schemas-microsoft-com:office:word'")
+    mhtml_body = mhtml_body.replace("<head>", "<head><meta http-equiv='Content-Type' content='text/html; charset=utf-8'>")
+    
+    mhtml += mhtml_body + "\n\n"
+    for cid, b64 in attachments.items():
+        formatted_b64 = '\n'.join(textwrap.wrap(b64, 76))
+        mhtml += f'--{boundary}\nContent-Type: image/png\nContent-Transfer-Encoding: base64\nContent-ID: <{cid}>\n\n{formatted_b64}\n\n'
+    mhtml += f"--{boundary}--\n"
+    return mhtml
+
+# =====================================================================
+# ★ 통합 보고서 다운로드 렌더링
+# =====================================================================
+st.divider()
+st.header("🖨️ 자동 산정 보고서 다운로드")
+st.info("💡 **초고속 병렬 다운로드 엔진 적용:** HTML 웹용 및 MS Word용 보고서를 즉시 생성합니다.")
+
+with st.spinner("보고서용 수식과 그림을 변환 중입니다..."):
+    mhtml_data = convert_html_to_mhtml(html_report_smoothing)
+
+col_d1, col_d2 = st.columns(2)
+with col_d1:
+    st.download_button(
+        label="📄 산정 보고서 다운로드 (HTML웹용)", 
+        data=html_report_smoothing.encode('utf-8'), 
+        file_name="장대케이슨_파력평활화_자동산정_보고서.html", 
+        mime="text/html", 
+        use_container_width=True
+    )
+with col_d2:
+    st.download_button(
+        label="📝 산정 보고서 다운로드 (MS Word용)", 
+        data=mhtml_data.encode('utf-8'), 
+        file_name="장대케이슨_파력평활화_자동산정_보고서.doc", 
+        mime="application/msword", 
+        use_container_width=True
+    )
