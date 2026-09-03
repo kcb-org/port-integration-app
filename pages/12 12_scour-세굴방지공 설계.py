@@ -36,10 +36,13 @@ def set_korean_font():
 set_korean_font()
 
 # =====================================================================
-# ★ 보고서 생성기 (수식 깨짐 완벽 방지 + 마크다운 렌더러 탑재)
+# ★ 보고서 생성기 (수식 깨짐 완벽 방지 + 마크다운 렌더러 탑재 + Word MHTML 지원)
 # =====================================================================
 class ReportBuilder:
     def __init__(self):
+        self.images = [] # Word용 이미지 저장소
+        
+        # 1. 웹 다운로드용 HTML 헤더
         self.html = """
         <!DOCTYPE html>
         <html><head><meta charset='utf-8'>
@@ -75,19 +78,66 @@ class ReportBuilder:
         </head><body class="tex2jax_process">
         <h1 style='text-align:center;'>🌊 항외측 세굴방지공 단면제원 자동 산정 보고서</h1><hr>
         """
-    
+
+        # 2. MS Word 다운로드용 HTML 헤더
+        self.word_html = """
+        <!DOCTYPE html>
+        <html><head><meta charset='utf-8'>
+        <title>세굴방지공 단면제원 계산 보고서</title>
+        <style>
+            body { font-family: 'Malgun Gothic', 'NanumGothic', sans-serif; line-height: 1.6; padding: 20px; color: #333; }
+            h2 { color: #1a73e8; border-bottom: 2px solid #1a73e8; padding-bottom: 5px; margin-top: 40px;}
+            h3 { color: #2c3e50; margin-top: 25px; }
+            h4 { color: #34495e; font-weight: bold; margin-top: 20px;}
+            .info-box { background-color: #e8f0fe; border-left: 4px solid #1a73e8; padding: 15px; margin: 15px 0; }
+            .success-box { background-color: #d4edda; border-left: 4px solid #28a745; padding: 15px; margin: 15px 0; color: #155724; }
+            .error-box { background-color: #f8d7da; border-left: 4px solid #dc3545; padding: 15px; margin: 15px 0; color: #721c24; }
+            .warning-box { background-color: #fff3cd; border-left: 4px solid #ffc107; padding: 15px; margin: 15px 0; color: #856404; }
+            .metric-box { border: 1px solid #ddd; padding: 10px; margin: 10px 0; text-align: center; background: #f8f9fa; }
+        </style>
+        </head><body>
+        <h1 style='text-align:center;'>🌊 항외측 세굴방지공 단면제원 자동 산정 보고서</h1><hr>
+        """
+        
+    def clean_math_for_word(self, text):
+        text = str(text)
+        text = text.replace("$H_0'$", "H<sub>0</sub>'")
+        text = text.replace("$h_i$", "h<sub>i</sub>")
+        text = text.replace("$h_s$", "h<sub>s</sub>")
+        text = text.replace("$h_c$", "h<sub>c</sub>")
+        text = text.replace("$U_z$", "U<sub>z</sub>")
+        text = text.replace("$S_m$", "S<sub>m</sub>")
+        text = text.replace("$H_s$", "H<sub>s</sub>")
+        text = text.replace("$T_s$", "T<sub>s</sub>")
+        text = text.replace("$B_{sp}$", "B<sub>sp</sub>")
+        text = text.replace("$H_{mo}$", "H<sub>mo</sub>")
+        text = text.replace("$t$", "t")
+        text = text.replace("$KC$", "KC")
+        import re
+        text = re.sub(r'\$([a-zA-Z]+)_([a-zA-Z0-9]+)\$', r'\1<sub>\2</sub>', text)
+        text = text.replace('$', '')
+        return text
+
+    def add_html(self, raw_html):
+        self.html += raw_html
+        word_raw = self.clean_math_for_word(raw_html)
+        self.word_html += word_raw.replace("class='metric-container'", "style='display:block;'")
+
     def _fmt(self, text):
+        import re
         text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', str(text))
         return text.replace('\n', '<br>')
 
     def title(self, text, level=2):
         st.markdown(f"{'#' * level} {text}")
         self.html += f"<h{level}>{text}</h{level}>"
+        self.word_html += f"<h{level}>{self.clean_math_for_word(text)}</h{level}>"
 
     def md(self, text):
         st.markdown(text)
         html_out = ""
         in_list = False
+        import re
         for line in text.split('\n'):
             if not line.strip(): continue
             content = line.strip()
@@ -109,53 +159,141 @@ class ReportBuilder:
                     
         if in_list: html_out += "</ul>\n"
         self.html += html_out
+        self.word_html += self.clean_math_for_word(html_out)
 
     def info(self, text):
         st.info(text)
         self.html += f"<div class='info-box'>{self._fmt(text)}</div>"
+        self.word_html += f"<div class='info-box'>{self.clean_math_for_word(self._fmt(text))}</div>"
 
     def success(self, text):
         st.success(text)
         self.html += f"<div class='success-box'>{self._fmt(text)}</div>"
+        self.word_html += f"<div class='success-box'>{self.clean_math_for_word(self._fmt(text))}</div>"
 
     def error(self, text):
         st.error(text)
         self.html += f"<div class='error-box'>{self._fmt(text)}</div>"
+        self.word_html += f"<div class='error-box'>{self.clean_math_for_word(self._fmt(text))}</div>"
 
     def warning(self, text):
         st.warning(text)
         self.html += f"<div class='warning-box'>{self._fmt(text)}</div>"
+        self.word_html += f"<div class='warning-box'>{self.clean_math_for_word(self._fmt(text))}</div>"
 
     def latex(self, eq):
         st.latex(eq)
+        # 1. 웹용 MathJax 삽입
         self.html += f"<div class='eq'>$$ {eq} $$</div>"
+        
+        # 2. Word용 수식 처리
+        import urllib.parse
+        import urllib.request
+        import re
+        import base64
+        
+        eq_for_word = str(eq)
+        
+        # [해결 2] 수식 안의 한글(\text{...})을 미리 빼내어 API 에러(### 깨짐) 방지
+        korean_parts = []
+        def replacer(match):
+            txt = match.group(1)
+            if re.search(r'[가-힣]', txt):
+                korean_parts.append(txt)
+                return "" # 수식 이미지에서는 한글을 뺌
+            return match.group(0)
+        
+        eq_for_word = re.sub(r'\\text\{([^}]+)\}', replacer, eq_for_word)
+        eq_url = urllib.parse.quote(eq_for_word.strip())
+        
+        # [해결 1] \b 가 백스페이스로 변환되는 것을 막기 위해 명시적으로 백슬래시 2개(\\) 적용
+        api_url = f"https://latex.codecogs.com/png.image?\\dpi{{150}}\\bg_white&space;{eq_url}"
+        
+        try:
+            req = urllib.request.Request(api_url, headers={'User-Agent': 'Mozilla/5.0'})
+            with urllib.request.urlopen(req, timeout=5) as response:
+                img_data = response.read()
+            encoded = base64.b64encode(img_data).decode('utf-8')
+            img_id = f"eq_{len(self.images)}"
+            self.images.append((img_id, encoded))
+            img_tag = f"<img src='cid:{img_id}' style='vertical-align: middle; border: none;'>"
+        except Exception:
+            img_tag = f"<img src='{api_url}' style='vertical-align: middle; border: none;'>"
+            
+        # 추출해 둔 한글이 있으면 수식 우측에 자연스럽게 텍스트로 붙임
+        korean_addon = f"<span style='margin-left: 10px; font-weight: bold; color: #555;'>[{' '.join(korean_parts)}]</span>" if korean_parts else ""
+        
+        # [해결 3] Word에서 수식 그림이 기괴하게 세로로 늘어나는 것을 차단하는 1x1 강제 테이블 래핑
+        self.word_html += f'''
+        <table align="center" style="border-collapse: collapse; border: none; margin: 10px auto;">
+            <tr>
+                <td style="border: none; padding: 0; text-align: center;">
+                    {img_tag} {korean_addon}
+                </td>
+            </tr>
+        </table>
+        '''
 
     def table(self, dataframe):
         st.table(dataframe)
-        self.html += dataframe.to_html(index=False, justify='center', escape=False)
+        self.html += dataframe.to_html(index=False, justify='center', escape=False, border=0)
+        
+        word_tag = dataframe.to_html(index=False, justify='center', escape=False, border=1)
+        word_tag = word_tag.replace('class="dataframe"', 'class="dataframe" style="border-collapse: collapse; width: 100%; border: 1px solid black;"')
+        word_tag = word_tag.replace('<th>', '<th style="border: 1px solid black; padding: 8px; background-color: #f2f2f2; text-align: center;">')
+        word_tag = word_tag.replace('<td>', '<td style="border: 1px solid black; padding: 8px; text-align: center;">')
+        self.word_html += f"<br>{self.clean_math_for_word(word_tag)}<br>"
 
     def metric(self, label, value):
         st.metric(label, value)
         self.html += f"<div class='metric-box'><b>{label}</b><br><span style='font-size:1.4em; color:#1a73e8; font-weight:bold;'>{value}</span></div>"
+        self.word_html += f"<div class='metric-box' style='border: 1px solid #ddd; padding: 10px; text-align: center;'><b>{self.clean_math_for_word(label)}</b><br><span style='font-size:1.4em; color:#1a73e8; font-weight:bold;'>{value}</span></div>"
 
     def fig(self, figure):
         st.pyplot(figure)
+        import io
+        import base64
         buf = io.BytesIO()
         figure.savefig(buf, format='png', bbox_inches='tight', dpi=150)
         buf.seek(0)
         encoded = base64.b64encode(buf.read()).decode('utf-8')
+        
         self.html += f"<div class='figure'><img src='data:image/png;base64,{encoded}' style='max-width:800px; width:100%; height:auto;'></div>"
+        
+        img_id = f"img_{len(self.images)}"
+        self.images.append((img_id, encoded))
+        self.word_html += f"<br clear='all'/><div style='text-align:center; margin: 20px 0;'><img src='cid:{img_id}' width='500'></div>"
 
     def image_pil(self, img_obj, caption=""):
         st.image(img_obj, use_container_width=True)
+        import io
+        import base64
         buf = io.BytesIO()
         img_obj.save(buf, format='PNG')
         encoded = base64.b64encode(buf.getvalue()).decode('utf-8')
+        
         self.html += f"<div class='figure'><img src='data:image/png;base64,{encoded}' style='max-width:800px; width:100%; height:auto;'><p><b>{caption}</b></p></div>"
+        
+        img_id = f"img_{len(self.images)}"
+        self.images.append((img_id, encoded))
+        self.word_html += f"<br clear='all'/><div style='text-align:center; margin: 20px 0;'><img src='cid:{img_id}' width='500'><p><b>{self.clean_math_for_word(caption)}</b></p></div>"
 
     def get_html(self):
         return self.html + "</body></html>"
-
+        
+    def get_mhtml(self):
+        boundary = "----=_NextPart_HTML_DOC_001"
+        final_word_html = self.word_html + "</body></html>"
+        
+        mhtml = f'MIME-Version: 1.0\nContent-Type: multipart/related; type="text/html"; boundary="{boundary}"\n\n'
+        mhtml += f'--{boundary}\nContent-Type: text/html; charset="utf-8"\nContent-Transfer-Encoding: 8bit\n\n'
+        mhtml += final_word_html + "\n\n"
+        
+        for img_id, b64_data in self.images:
+            mhtml += f'--{boundary}\nContent-Type: image/png\nContent-Transfer-Encoding: base64\nContent-ID: <{img_id}>\n\n{b64_data}\n\n'
+            
+        mhtml += f"--{boundary}--\n"
+        return mhtml
 
 # ==========================================
 # 1. 페이지 설정
@@ -300,22 +438,22 @@ h_full, df_full = run_sato_tanaka_details(2.40)
 
 tab1, tab2 = st.tabs(["표층 이동한계 (α=1.35)", "완전 이동한계 (α=2.40)"])
 with tab1:
-    rep.html += "<h4>■ 표층 이동한계 (α=1.35)</h4>"
+    rep.add_html("<h4>■ 표층 이동한계 (α=1.35)</h4>")
     rep.table(df_surf)
     rep.success(f"최종 표층이동 한계수심 ($h_s$): **{h_surf:.2f} m**")
 with tab2:
-    rep.html += "<h4>■ 완전 이동한계 (α=2.40)</h4>"
+    rep.add_html("<h4>■ 완전 이동한계 (α=2.40)</h4>")
     rep.table(df_full)
     rep.success(f"최종 완전이동 한계수심 ($h_c$): **{h_full:.2f} m**")
 
 rep.title("다. 원지반 세굴 여부 최종 판정", level=3)
 
-rep.html += "<div class='metric-container'>"
+rep.add_html("<div class='metric-container'>")
 col_h1, col_h2, col_h3 = st.columns(3)
 with col_h1: rep.metric("현재 설계수심 ($h$)", f"{h_bed:.2f} m")
 with col_h2: rep.metric("표층이동 한계수심 ($h_s$)", f"{h_surf:.2f} m")
 with col_h3: rep.metric("완전이동 한계수심 ($h_c$)", f"{h_full:.2f} m")
-rep.html += "</div>"
+rep.add_html("</div>")
 
 rep.title("[판정 결과]", level=4)
 if h_bed <= h_surf:
@@ -331,7 +469,7 @@ else:
 # 5. 2. 세굴방지공 계획
 # ==========================================
 st.markdown("---")
-rep.html += "<hr>"
+rep.add_html("<hr>")
 rep.title("2. 세굴방지공 계획", level=2)
 
 # 변수 초기화
@@ -753,14 +891,29 @@ with summary_placeholder.container():
     else:
         rep.success("✅ **원지반 안정 / 보강 불필요** (현재 수심이 표층이동 한계수심보다 깊어 세굴방지공이 불필요합니다.)")
     st.markdown("---")
-    rep.html += "<hr>"
+    rep.add_html("<hr>")
 
 # --- 최종 통합 HTML 보고서 다운로드 버튼 ---
 st.divider()
-st.download_button(
-    label="📄 통합 산정 보고서 다운로드 (.html)",
-    data=rep.get_html(),
-    file_name=f"세굴방지공_단면제원_자동산정_보고서.html",
-    mime="text/html",
-    help="클릭 시 수식이 완벽히 복원된 HTML 형태의 보고서를 다운로드합니다."
-)
+
+col_btn1, col_btn2 = st.columns(2)
+
+with col_btn1:
+    st.download_button(
+        label="📄 통합 산정 보고서 다운로드 (HTML 웹용)",
+        data=rep.get_html(),
+        file_name="세굴방지공_단면제원_자동산정_보고서.html",
+        mime="text/html",
+        use_container_width=True,
+        help="인터넷 브라우저에서 열람하며, 인쇄(Ctrl+P) - PDF 저장에 최적화되어 있습니다."
+    )
+
+with col_btn2:
+    st.download_button(
+        label="📝 통합 산정 보고서 다운로드 (MS Word용)",
+        data=rep.get_mhtml(), # 이미지가 완벽히 박제된 MHTML 데이터 전송
+        file_name="세굴방지공_단면제원_자동산정_보고서.doc",
+        mime="application/msword",
+        use_container_width=True,
+        help="MS Word에서 즉시 편집 가능한 포맷입니다. 수식 깨짐 및 표 잘림을 방지했습니다."
+    )
