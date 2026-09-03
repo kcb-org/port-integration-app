@@ -5,10 +5,15 @@ import math
 import os
 import base64
 import re
+import io
+import urllib.request
+import urllib.parse  # 👈 이 줄을 import 구문들 사이에 추가해주세요!
+import concurrent.futures
+import matplotlib.font_manager as fm
+import matplotlib.pyplot as plt
 from scipy.interpolate import griddata, interp1d
 from scipy.optimize import brentq
 from PIL import Image, ImageDraw, ImageFont
-
 # =====================================================================
 # 사이드바 설정
 # =====================================================================
@@ -18,6 +23,29 @@ with st.sidebar:
     st.write("**소속:** [다온기술]")
     st.caption("© 2026 All rights reserved.")
 
+@st.cache_data(show_spinner=False)
+def fetch_equation_image(api_url):
+    try:
+        req = urllib.request.Request(api_url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=5) as response:
+            return base64.b64encode(response.read()).decode('utf-8')
+    except Exception:
+        return None
+
+def render_fast_download(rep_obj, filename_base):
+    st.divider()
+    st.header("🖨️ 종합 검토 보고서 다운로드")
+    st.info("💡 **초고속 병렬 다운로드 엔진 적용:** HTML 웹용 및 MS Word용 보고서를 각각 1~2초 이내에 즉시 생성합니다[cite: 5].")
+    
+    with st.spinner("보고서용 수식과 그림을 고속 변환 중입니다..."):
+        report_html = rep_obj.get_html()
+        mhtml_data = rep_obj.get_mhtml()
+        
+    col1, col2 = st.columns(2)
+    with col1:
+        st.download_button("📄 종합 검토 보고서 다운로드 (HTML 웹용)", data=report_html.encode('utf-8'), file_name=f"{filename_base}.html", mime="text/html", use_container_width=True)
+    with col2:
+        st.download_button("📝 종합 검토 보고서 다운로드 (MS Word용)", data=mhtml_data.encode('utf-8'), file_name=f"{filename_base}.doc", mime="application/msword", use_container_width=True)
 # =====================================================================
 # ★ 보고서 생성기
 # =====================================================================
@@ -160,12 +188,214 @@ class ReportBuilder:
     def static_img(self, img_path, caption=""):
         if os.path.exists(img_path):
             st.image(img_path, caption=caption)
-            with open(img_path, "rb") as f:
-                encoded = base64.b64encode(f.read()).decode('utf-8')
-            self.html += f"<div class='figure'><img src='data:image/png;base64,{encoded}' style='max-width:100%; height:auto; border: 1px solid #ccc;'><p><b>{caption}</b></p></div>"
+            try:
+                with Image.open(img_path) as im:
+                    buf = io.BytesIO()
+                    im.convert("RGB").save(buf, format="PNG")
+                    encoded = base64.b64encode(buf.getvalue()).decode('utf-8')
+            except Exception:
+                with open(img_path, "rb") as f:
+                    encoded = base64.b64encode(f.read()).decode('utf-8')
+            
+            self.html += f"<div class='figure'><img src=\"data:image/png;base64,{encoded}\" width=\"650\"><p><b>{caption}</b></p></div>"
 
     def get_html(self):
         return self.html + "</body></html>"
+
+    def get_mhtml(self):
+        import urllib.parse
+        import concurrent.futures
+        import textwrap
+        
+        report_html = self.get_html()
+        word_html = report_html
+        attachments = {}
+        counters = {'img': 0, 'eq': 0}
+
+        word_html = re.sub(r'<script.*?</script>', '', word_html, flags=re.DOTALL)
+        word_html = word_html.replace('<table', '<table style="border-collapse: collapse; width: 100%; border: 1px solid black; margin-bottom: 20px;"')
+        word_html = word_html.replace('<th>', '<th style="border: 1px solid black; padding: 8px; background-color: #f2f2f2; text-align: center;">')
+        word_html = word_html.replace('<td>', '<td style="border: 1px solid black; padding: 8px; text-align: center;">')
+
+        def image_replacer(match):
+            b64_data = match.group(1)
+            counters['img'] += 1
+            img_id = f"embedded_img_{counters['img']}"
+            attachments[img_id] = b64_data
+            return f'<img src="cid:{img_id}" width="650">'
+        
+        word_html = re.sub(r'src=["\']data:image/[a-zA-Z]+;base64,([^\'"]+)["\']', image_replacer, word_html)
+
+        display_maths = re.findall(r'\$\$(.*?)\$\$', word_html, flags=re.DOTALL)
+        inline_maths = re.findall(r'\$([^\$]+)\$', word_html)
+        urls_to_fetch = set()
+        
+        def prepare_url(eq_text, is_display):
+            eq_c = re.sub(r'\\text\{([^}]+)\}', lambda m: "" if re.search(r'[가-힣]', m.group(1)) else m.group(0), eq_text)
+            eq_c = eq_c.replace(r'\max', 'max').replace(r'\min', 'min').replace(r'\mathbf', '')
+            dpi = "110" if is_display else "100"
+            return f"https://latex.codecogs.com/png.image?\\dpi{{{dpi}}}\\bg_white&space;{urllib.parse.quote(eq_c)}"
+        
+        for eq in display_maths: urls_to_fetch.add(prepare_url(eq.strip(), True))
+        for eq in inline_maths:
+            txt = eq.strip()
+            if any(op in txt for op in ["\\", "=", "+", "-", "/", "times", "ge", "le", "<", ">", "^", "_"]):
+                urls_to_fetch.add(prepare_url(txt, False))
+                
+        with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
+            list(executor.map(fetch_equation_image, urls_to_fetch))
+
+        def render_math_to_img(eq_text, is_display):
+            korean_parts = []
+            def kr_replacer(m):
+                txt = m.group(1)
+                if re.search(r'[가-힣]', txt):
+                    korean_parts.append(txt)
+                    return ""
+                return m.group(0)
+            eq_c = re.sub(r'\\text\{([^}]+)\}', kr_replacer, eq_text)
+            eq_c = eq_c.replace(r'\max', 'max').replace(r'\min', 'min').replace(r'\mathbf', '')
+            
+            api_url = prepare_url(eq_text, is_display)
+            counters['eq'] += 1
+            img_id = f"eq_img_{counters['eq']}"
+            b64_img = fetch_equation_image(api_url)
+            
+            if b64_img:
+                attachments[img_id] = b64_img
+                img_tag = f"<img src='cid:{img_id}' style='vertical-align: middle; border: none; max-width: 100%;'>"
+            else:
+                img_tag = f"<img src='{api_url}' style='vertical-align: middle; border: none; max-width: 100%;'>"
+            
+            kr_addon = f"<span style='margin-left:5px; font-weight:bold; color:#555;'>[{' '.join(korean_parts)}]</span>" if korean_parts else ""
+            return img_tag, kr_addon
+
+        def display_math_replacer(match):
+            img_tag, kr_addon = render_math_to_img(match.group(1).strip(), True)
+            return f'<table align="center" style="border-collapse: collapse; border: none; margin: 10px auto; width: 100%;"><tr><td style="border: none; padding: 0; text-align: center;">{img_tag} {kr_addon}</td></tr></table>'
+        word_html = re.sub(r'\$\$(.*?)\$\$', display_math_replacer, word_html, flags=re.DOTALL)
+
+        def inline_math_replacer(match):
+            eq_text = match.group(1).strip()
+            if any(op in eq_text for op in ["\\", "=", "+", "-", "/", "times", "ge", "le", "<", ">", "^", "_"]):
+                img_tag, kr_addon = render_math_to_img(eq_text, False)
+                return f"{img_tag}{kr_addon}"
+            else:
+                return f"${eq_text}$"
+        word_html = re.sub(r'\$([^\$]+)\$', inline_math_replacer, word_html)
+
+        word_html = word_html.replace("$H_{1/3}$", "H<sub>1/3</sub>").replace("$T_{1/3}$", "T<sub>1/3</sub>").replace("$L_0$", "L<sub>0</sub>")
+        word_html = word_html.replace("$R_c$", "R<sub>c</sub>").replace("$H_s$", "H<sub>s</sub>").replace("$q_{all}$", "q<sub>all</sub>")
+        word_html = word_html.replace("$\\gamma_\\theta$", "γ<sub>θ</sub>").replace("$\\gamma_f$", "γ<sub>f</sub>").replace("$\\gamma_b$", "γ<sub>b</sub>")
+        word_html = word_html.replace("$\\gamma_h$", "γ<sub>h</sub>").replace("$\\gamma_\\beta$", "γ<sub>β</sub>").replace("$\\gamma_s$", "γ<sub>s</sub>")
+        word_html = re.sub(r'\$([a-zA-Z]+)_([a-zA-Z0-9\+\-]+)\$', r'\1<sub>\2</sub>', word_html)
+        word_html = word_html.replace('$', '')
+
+        boundary = "----=_NextPart_HTML_DOC_001"
+        mhtml = f'MIME-Version: 1.0\nContent-Type: multipart/related; type="text/html"; boundary="{boundary}"\n\n'
+        mhtml += f'--{boundary}\nContent-Type: text/html; charset="utf-8"\nContent-Transfer-Encoding: 8bit\n\n'
+        mhtml += word_html + "\n\n"
+        
+        for cid, b64 in attachments.items():
+            formatted_b64 = '\n'.join(textwrap.wrap(b64, 76))
+            mhtml += f'--{boundary}\nContent-Type: image/png\nContent-Transfer-Encoding: base64\nContent-ID: <{cid}>\n\n{formatted_b64}\n\n'
+        mhtml += f"--{boundary}--\n"
+        return mhtml
+
+    def get_mhtml(self):
+        report_html = self.get_html()
+        word_html = report_html
+        attachments = {}
+        counters = {'img': 0, 'eq': 0}
+
+        word_html = re.sub(r'<script.*?</script>', '', word_html, flags=re.DOTALL)
+        word_html = word_html.replace('<table', '<table style="border-collapse: collapse; width: 100%; border: 1px solid black; margin-bottom: 20px;"')
+        word_html = word_html.replace('<th>', '<th style="border: 1px solid black; padding: 8px; background-color: #f2f2f2; text-align: center;">')
+        word_html = word_html.replace('<td>', '<td style="border: 1px solid black; padding: 8px; text-align: center;">')
+
+        def image_replacer(match):
+            b64_data = match.group(1)
+            counters['img'] += 1
+            img_id = f"fig_img_{counters['img']}"
+            attachments[img_id] = b64_data
+            return f'<table align="center" style="border-collapse: collapse; border: none; margin: 10px auto;"><tr><td style="border: none; padding: 0; text-align: center;"><img src="cid:{img_id}" width="650"></td></tr></table>'
+        
+        word_html = re.sub(r'<img[^>]+src=[\'"]data:image/png;base64,([^\'"]+)[\'"][^>]*>', image_replacer, word_html)
+
+        display_maths = re.findall(r'\$\$(.*?)\$\$', word_html, flags=re.DOTALL)
+        inline_maths = re.findall(r'\$([^\$]+)\$', word_html)
+        urls_to_fetch = set()
+        
+        def prepare_url(eq_text, is_display):
+            eq_c = re.sub(r'\\text\{([^}]+)\}', lambda m: "" if re.search(r'[가-힣]', m.group(1)) else m.group(0), eq_text)
+            eq_c = eq_c.replace(r'\max', 'max').replace(r'\min', 'min').replace(r'\mathbf', '')
+            dpi = "110" if is_display else "100"
+            return f"https://latex.codecogs.com/png.image?\\dpi{{{dpi}}}\\bg_white&space;{urllib.parse.quote(eq_c)}"
+        
+        for eq in display_maths: urls_to_fetch.add(prepare_url(eq.strip(), True))
+        for eq in inline_maths:
+            txt = eq.strip()
+            if any(op in txt for op in ["\\", "=", "+", "-", "/", "times", "ge", "le", "<", ">", "^", "_"]):
+                urls_to_fetch.add(prepare_url(txt, False))
+                
+        with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
+            list(executor.map(fetch_equation_image, urls_to_fetch))
+
+        def render_math_to_img(eq_text, is_display):
+            korean_parts = []
+            def kr_replacer(m):
+                txt = m.group(1)
+                if re.search(r'[가-힣]', txt):
+                    korean_parts.append(txt)
+                    return ""
+                return m.group(0)
+            eq_c = re.sub(r'\\text\{([^}]+)\}', kr_replacer, eq_text)
+            eq_c = eq_c.replace(r'\max', 'max').replace(r'\min', 'min').replace(r'\mathbf', '')
+            
+            api_url = prepare_url(eq_text, is_display)
+            counters['eq'] += 1
+            img_id = f"eq_img_{counters['eq']}"
+            b64_img = fetch_equation_image(api_url)
+            
+            if b64_img:
+                attachments[img_id] = b64_img
+                img_tag = f"<img src='cid:{img_id}' style='vertical-align: middle; border: none; max-width: 100%;'>"
+            else:
+                img_tag = f"<img src='{api_url}' style='vertical-align: middle; border: none; max-width: 100%;'>"
+            
+            kr_addon = f"<span style='margin-left:5px; font-weight:bold; color:#555;'>[{' '.join(korean_parts)}]</span>" if korean_parts else ""
+            return img_tag, kr_addon
+
+        def display_math_replacer(match):
+            img_tag, kr_addon = render_math_to_img(match.group(1).strip(), True)
+            return f'<table align="center" style="border-collapse: collapse; border: none; margin: 10px auto; width: 100%;"><tr><td style="border: none; padding: 0; text-align: center;">{img_tag} {kr_addon}</td></tr></table>'
+        word_html = re.sub(r'\$\$(.*?)\$\$', display_math_replacer, word_html, flags=re.DOTALL)
+
+        def inline_math_replacer(match):
+            eq_text = match.group(1).strip()
+            if any(op in eq_text for op in ["\\", "=", "+", "-", "/", "times", "ge", "le", "<", ">", "^", "_"]):
+                img_tag, kr_addon = render_math_to_img(eq_text, False)
+                return f"{img_tag}{kr_addon}"
+            else:
+                return f"${eq_text}$"
+        word_html = re.sub(r'\$([^\$]+)\$', inline_math_replacer, word_html)
+
+        word_html = word_html.replace("$H_{1/3}$", "H<sub>1/3</sub>").replace("$T_{1/3}$", "T<sub>1/3</sub>").replace("$L_0$", "L<sub>0</sub>")
+        word_html = word_html.replace("$R_c$", "R<sub>c</sub>").replace("$H_s$", "H<sub>s</sub>").replace("$q_{all}$", "q<sub>all</sub>")
+        word_html = word_html.replace("$\\gamma_\\theta$", "γ<sub>θ</sub>").replace("$\\gamma_f$", "γ<sub>f</sub>").replace("$\\gamma_b$", "γ<sub>b</sub>")
+        word_html = word_html.replace("$\\gamma_h$", "γ<sub>h</sub>").replace("$\\gamma_\\beta$", "γ<sub>β</sub>").replace("$\\gamma_s$", "γ<sub>s</sub>")
+        word_html = re.sub(r'\$([a-zA-Z]+)_([a-zA-Z0-9\+\-]+)\$', r'\1<sub>\2</sub>', word_html)
+        word_html = word_html.replace('$', '')
+
+        boundary = "----=_NextPart_HTML_DOC_001"
+        mhtml = f'MIME-Version: 1.0\nContent-Type: multipart/related; type="text/html"; boundary="{boundary}"\n\n'
+        mhtml += f'--{boundary}\nContent-Type: text/html; charset="utf-8"\nContent-Transfer-Encoding: 8bit\n\n'
+        mhtml += word_html + "\n\n"
+        
+        for cid, b64 in attachments.items():
+            mhtml += f'--{boundary}\nContent-Type: image/png\nContent-Transfer-Encoding: base64\nContent-ID: <{cid}>\n\n{b64}\n\n'
+        mhtml += f"--{boundary}--\n"
+        return mhtml
 
 # =====================================================================
 # 핵심 수리 및 Goda 도표 보간 엔진
@@ -371,8 +601,10 @@ class GodaCalculator:
                 draw.rectangle([bbox[0]-5, bbox[1]-5, bbox[2]+5, bbox[3]+5], fill="white", outline="blue", width=2)
             except AttributeError: pass
             draw.text((x_px + 15, y_px - 55), text_str, fill="black", font=font)
-            out_path = f"annotated_{bmp_file}"
-            img.save(out_path)
+            
+            # 💡 확장자를 .png로 강제 변경하고 PNG 포맷으로 저장
+            out_path = f"annotated_{os.path.splitext(bmp_file)[0]}.png"
+            img.save(out_path, format="PNG")
             return out_path
         except: return bmp_file
 
@@ -608,11 +840,21 @@ chk_goda = st.sidebar.checkbox("일본 기준 (Goda 원본 CSV/도표 정밀 보
 
 # 📌 기존에 있던 st.subheader("📐 [선택 구조 단면 개요 도면]") 및 관련 st.image() 출력 블록 전체 삭제
 
+# ★ 세션 상태 초기화 (맨 처음 실행 시 False)
+if 'wot_calculated' not in st.session_state:
+    st.session_state['wot_calculated'] = False
+
 calc_btn = st.sidebar.button(f"🚀 종합 {calc_mode} 실행 및 보고서 렌더링", use_container_width=True, type="primary")
 
+# 버튼을 누르면 True로 상태 고정
 if calc_btn:
+    st.session_state['wot_calculated'] = True
+
+# 버튼을 안 누르고 다운로드 버튼만 눌러도 True 상태가 유지되어 화면이 안 사라짐
+if st.session_state['wot_calculated']:
     rep = ReportBuilder()
     rep.title(f"📑 {struct_type} {calc_mode} 비교 검토 결과 보고서", level=2)
+    # (... 기존 중간 계산 코드들은 그대로 유지하면서 들여쓰기만 맞춤 유지 ...)
     
     # ★ 보고서 최상단 기본 단면도 이미지 삽입 코드 삭제 완료 ★
     if struct_type == "경사제 (Rubble Mound)":
@@ -1902,9 +2144,4 @@ if calc_btn:
         rep.warn("검토 대상 기준 체크박스가 선택되지 않았습니다.")
 
     st.divider()
-    st.download_button(
-        label="📄 월파량/여유고 상세 종합 검토 보고서 다운로드 (.html)",
-        data=rep.get_html(),
-        file_name=f"KDS_항만구조물_종합검토보고서.html",
-        mime="text/html"
-    )
+    render_fast_download(rep, f"KDS_항만구조물_종합검토보고서")
