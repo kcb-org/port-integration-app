@@ -20,7 +20,7 @@ st.set_page_config(page_title="최대파고 산정 프로그램", layout="wide",
 
 with st.sidebar:
     st.markdown("---")
-    st.write("**제작자:** [김창보, 홍운철, 한승우, 김건오, 송호진]")
+    st.write("**제작자:** [김창보]")
     st.write("**소속:** [다온기술]")
     st.caption("© 2026 All rights reserved.")
 
@@ -294,6 +294,7 @@ def get_final_graph_ratio(h_H0p_val, H0p_L0_val, tanTheta):
     return val1 + weight * (val2 - val1)
 
 def plot_authentic_chart_spline(h_H0p_read, read_ratio, user_H0p_L0, tanTheta):
+    # 화면 출력을 위해 원래의 완벽한 비율로 되돌립니다.
     fig, ax = plt.subplots(figsize=(5.5, 6.8)) 
     
     closest_slope = min(goda_data_master.keys(), key=lambda k: abs(k - tanTheta))
@@ -985,36 +986,40 @@ with col2:
             buf.seek(0)
             img_base64 = base64.b64encode(buf.read()).decode("utf-8")
 
-            # 1. HTML 렌더링 전 조건별 텍스트 사전 정의
+            # 1. HTML 렌더링 전 조건별 텍스트 정제 (마크다운 및 수식을 순수 HTML로 변환)
+            def clean_html_text(text):
+                if not text: return text
+                t = text.replace("**", "")
+                t = t.replace("$H_{1/3}$", "H<sub>1/3</sub>")
+                return t
+
             if is_breaking:
                 box_class_1 = "success-box"
-                reason_text_1 = "전면수심이 환산심해파고의 3배 이하(\\(h/H_0' \\le 3.0\\))이므로 <strong>쇄파에 의한 저감을 고려</strong>하여 산정도와 약산식 중 큰 값을 최종 선정함."
+                reason_text_1 = "전면수심이 환산심해파고의 3배 이하(h/H<sub>0</sub>' &le; 3.0)이므로 <strong>쇄파에 의한 저감을 고려</strong>하여 산정도와 약산식 중 큰 값을 최종 선정함."
                 box_class_2 = "success-box"
-                reason_text_2 = "전면수심이 환산심해파고의 3배 이하이므로 <strong>쇄파 저감 조건</strong>에 해당"
+                reason_text_2 = "전면수심이 환산심해파고의 3배 이하이므로 쇄파 저감 조건에 해당"
             else:
                 box_class_1 = "info-box"
-                reason_text_1 = "전면수심이 환산심해파고의 3배 초과(\\(h/H_0' > 3.0\\))이므로 쇄파에 의한 저감이 없다고 보아 <strong>비쇄파파고</strong>를 최종 선정함."
+                reason_text_1 = "전면수심이 환산심해파고의 3배 초과(h/H<sub>0</sub>' > 3.0)이므로 쇄파에 의한 저감이 없다고 보아 <strong>비쇄파파고</strong>를 최종 선정함."
                 box_class_2 = "warning-box"
-                reason_text_2 = "전면수심이 환산심해파고의 3배를 초과하므로 <strong>비쇄파 조건</strong>에 해당"
+                reason_text_2 = "전면수심이 환산심해파고의 3배를 초과하므로 비쇄파 조건에 해당"
 
             ks_text = "자동 판독 (슈토 도해 4-3)" if auto_ks else "수동 입력"
-
-            # 2. 분수 및 비고 문자열 정리
             tan_denom = int(1 / tanTheta) if tanTheta > 0 else 0
             tan_theta_str = f"1/{tan_denom}" if tan_denom > 0 else "0"
 
-            note_graph = applied_str_graph if applied_str_graph else "비교용"
-            note_form = applied_str_form if applied_str_form else "비교용"
-            note_non = applied_str_non if applied_str_non else "참고용 (1.8 × H1/3)"
+            # 요약 테이블 비고란 텍스트 정제 적용
+            note_graph = clean_html_text(applied_str_graph) if applied_str_graph else "비교용"
+            note_form = clean_html_text(applied_str_form) if applied_str_form else "비교용"
+            note_non = clean_html_text(applied_str_non) if applied_str_non else "참고용 (1.8 &times; H<sub>1/3</sub>)"
 
-            # 3. HTML 보고서 문자열 생성
+            # 2. HTML 보고서 문자열 생성 (수식은 모두 순수 HTML 태그 적용)
             raw_html = f"""
             <!DOCTYPE html>
             <html lang="ko">
             <head>
                 <meta charset="UTF-8">
                 <title>최대파고 산정 상세 보고서</title>
-                <script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
                 <style>
                     body {{ font-family: 'Malgun Gothic', sans-serif; line-height: 1.6; padding: 30px; max-width: 900px; margin: auto; color: #333; }}
                     h2 {{ border-bottom: 2px solid #333; padding-bottom: 10px; text-align: center; }}
@@ -1044,7 +1049,7 @@ with col2:
 
                 <h3>📊 1. 검토 결과 요약</h3>
                 <table>
-                    <tr><th>산정 방법</th><th>계산 결과 (\\(H_{{max}}\\))</th><th>비고</th></tr>
+                    <tr><th>산정 방법</th><th>계산 결과 (H<sub>max</sub>)</th><th>비고</th></tr>
                     <tr><td>쇄파대 내 최대파고 산정도</td><td><strong>{Hmax_graph:.4f} m</strong></td><td>{note_graph}</td></tr>
                     <tr><td>쇄파대 내 최대파고 약산식</td><td><strong>{Hmax_form:.4f} m</strong></td><td>{note_form}</td></tr>
                     <tr><td>비쇄파시 최대파고</td><td><strong>{Hmax_non_breaking:.4f} m</strong></td><td>{note_non}</td></tr>
@@ -1059,10 +1064,10 @@ with col2:
                 <h4>1) 설계조건</h4>
                 <table>
                     <tr>
-                        <th>설계 유의파고 (\\(H_{{1/3}}\\))</th>
-                        <th>설계 주기 (\\(T_{{1/3}}\\))</th>
-                        <th>적용 수심 (\\(h\\))</th>
-                        <th>해저 경사 (\\(\\tan\\theta\\))</th>
+                        <th>설계 유의파고 (H<sub>1/3</sub>)</th>
+                        <th>설계 주기 (T<sub>1/3</sub>)</th>
+                        <th>적용 수심 (h)</th>
+                        <th>해저 경사 (tan&theta;)</th>
                     </tr>
                     <tr>
                         <td><strong>{H13:.2f} m</strong></td>
@@ -1074,51 +1079,45 @@ with col2:
 
                 <h4>2) 기본 제원 및 심해파 환산</h4>
                 <ul>
-                    <li><strong>설계유의파주기 (\\(T_{{1/3}}\\))</strong> = {T13} \\(\\mathrm{{s}}\\);</li>
-                    <li><strong>심해파장 (\\(L_0\\))</strong> = \\(1.56 \\times T_{{1/3}}^2\\) = \\(1.56 \\times {T13}^2\\) = <strong>{L0:.4f} m</strong></li>
-                    <li><strong>파형경사 (\\(h/L_0\\))</strong> = {h} / {L0:.4f} = <strong>{d_L0:.6f}</strong></li>
+                    <li><strong>설계유의파주기 (T<sub>1/3</sub>)</strong> = {T13} s</li>
+                    <li><strong>심해파장 (L<sub>0</sub>)</strong> = 1.56 &times; T<sub>1/3</sub><sup>2</sup> = 1.56 &times; {T13}<sup>2</sup> = <strong>{L0:.4f} m</strong></li>
+                    <li><strong>파형경사 (h/L<sub>0</sub>)</strong> = {h} / {L0:.4f} = <strong>{d_L0:.6f}</strong></li>
                 </ul>
 
-                <h4>3) 수정환산심해파고 (\\(H_0'\\)) 및 천수계수 (\\(K_s\\)) 산출 과정</h4>
+                <h4>3) 수정환산심해파고 (H<sub>0</sub>') 및 천수계수 (K<sub>s</sub>) 산출 과정</h4>
                 <div class="box info-box">
-                    <strong>[수정환산심해파고 (\\(H_0'\\)) 수치해석적 역산]</strong><br>
-                    Goda의 쇄파대 내 파고 약산식은 \\(H_0'\\)에 대해 양음함수(비선형) 형태이므로 이분법을 통한 수치해석적 역산을 수행합니다.<br>
+                    <strong>[수정환산심해파고 (H<sub>0</sub>') 수치해석적 역산]</strong><br>
+                    Goda의 쇄파대 내 파고 약산식은 H<sub>0</sub>'에 대해 양음함수(비선형) 형태이므로 이분법을 통한 수치해석적 역산을 수행합니다.<br>
                     <ul>
-                        <li>목표 설계유의파고 (\\(H_{{1/3}}\\)) = <strong>{H13} m</strong></li>
-                        <li>수치해석 역산 결과 (\\(H_0'\\)) = <strong>{verified_H0p:.4f} m</strong></li>
-                        <li>환산심해파형경사 (\\(H_0'/L_0\\)) = <strong>{H0p_L0_val:.6f}</strong></li>
+                        <li>목표 설계유의파고 (H<sub>1/3</sub>) = <strong>{H13} m</strong></li>
+                        <li>수치해석 역산 결과 (H<sub>0</sub>') = <strong>{verified_H0p:.4f} m</strong></li>
+                        <li>환산심해파형경사 (H<sub>0</sub>'/L<sub>0</sub>) = <strong>{H0p_L0_val:.6f}</strong></li>
                     </ul>
                 </div>
 
                 <div class="box success-box">
-                    <strong>[천수계수 (\\(K_s\\)) {ks_text}]</strong><br>
-                    반영된 천수계수 (\\(K_s\\)) = <strong>{final_Ks:.4f}</strong>
+                    <strong>[천수계수 (K<sub>s</sub>) {ks_text}]</strong><br>
+                    반영된 천수계수 (K<sub>s</sub>) = <strong>{final_Ks:.4f}</strong>
                 </div>
 
-                <div class="box info-box" style="font-size: 13px;">
-                    <strong>📌 참고) 슈토(1974)의 비선형 장파이론</strong><br>
-                    • 도해(4-3)은 슈토(1974)의 비선형 장파이론에 근거한 것으로 천수변형을 추정할 수 있고 천수변형만을 고려하는 경우 환산심해파고는 심해파고와 동일하다.<br>
-                    • 쇄파 이전의 천해역에서 불규칙파의 천수계수는 장파 영역 내외의 여하에 관계없이 유의파로 대표된 도해(4-3)을 이용할 수 있다.
-                </div>
-
-                <h4>3-1) \\(H_{{1/3}}\\) 자동역산 상세 과정</h4>
-                <p><strong>⓵ 쇄파대 내 파고 약산식을 이용한 \\(H_{{1/3}}\\) 산정</strong></p>
+                <h4>3-1) H<sub>1/3</sub> 자동역산 상세 과정</h4>
+                <p><strong>⓵ 쇄파대 내 파고 약산식을 이용한 H<sub>1/3</sub> 산정</strong></p>
                 <table>
                     <tr><th>구분</th><th>기호</th><th>산출식 / 설명</th><th>산출결과</th><th>비고</th></tr>
-                    <tr><td><strong>여기서,</strong></td><td>\\(\\beta_0\\)</td><td>\\(0.028(H_0'/L_0)^{{-0.38}} \\exp[20(\\tan\\theta)^{{1.5}}]\\)</td><td><strong>{f_b0:.3f}</strong></td><td></td></tr>
-                    <tr><td></td><td>\\(\\beta_1\\)</td><td>\\(0.52 \\exp[4.2 \\tan\\theta]\\)</td><td><strong>{f_b1:.3f}</strong></td><td></td></tr>
-                    <tr><td></td><td>\\(\\beta_{{max}}\\)</td><td>\\(\\max(0.92, 0.32(H_0'/L_0)^{{-0.29}} \\exp[2.4 \\tan\\theta])\\)</td><td><strong>{f_bM:.3f}</strong></td><td></td></tr>
-                    <tr><td></td><td>\\(K_s\\)</td><td>비선형 천수계수</td><td><span style="border: 2px solid black; padding: 2px 8px; font-weight:bold;">{final_Ks:.3f}</span></td><td>맞추기</td></tr>
-                    <tr><td></td><td>\\(H_0'\\)</td><td>환산심해파고 (m)</td><td><span style="border: 2px solid black; padding: 2px 8px; font-weight:bold;">{verified_H0p:.2f}</span></td><td>맞추기</td></tr>
-                    <tr><td></td><td>\\(\\tan\\theta\\)</td><td>해저경사</td><td><strong>{tan_theta_str}</strong></td><td></td></tr>
-                    <tr><td></td><td>\\(h\\)</td><td>적용 수심 (m)</td><td><strong>{h:.2f}</strong></td><td></td></tr>
-                    <tr><td></td><td>\\(L_0\\)</td><td>심해파장 (m)</td><td><strong>{L0:.2f}</strong></td><td></td></tr>
-                    <tr><td></td><td>\\(h/L_0\\)</td><td>상대 수심</td><td><strong>{d_L0:.3f}</strong></td><td>{cond_str}</td></tr>
-                    <tr><td></td><td>\\(H_0'/L_0\\)</td><td>환산심해파형경사</td><td><strong>{H0p_L0_val:.3f}</strong></td><td></td></tr>
-                    <tr><td></td><td>조건 1</td><td>\\(\\beta_0 H_0' + \\beta_1 h\\)</td><td><strong>{f_val1:.2f}</strong></td><td></td></tr>
-                    <tr><td></td><td>조건 2</td><td>\\(\\beta_{{max}} H_0'\\)</td><td><strong>{f_val2:.2f}</strong></td><td></td></tr>
-                    <tr><td></td><td>조건 3</td><td>\\(K_s H_0'\\)</td><td><strong>{f_val3:.2f}</strong></td><td></td></tr>
-                    <tr><td><strong>결과</strong></td><td><strong>\\(H_{{1/3}}\\)</strong></td><td><strong>유의파고</strong></td><td><span style="border: 2px solid black; padding: 2px 8px; font-weight:bold; font-size:1.1em;">{final_H13_calc:.2f} m</span></td><td></td></tr>
+                    <tr><td><strong>여기서,</strong></td><td>&beta;<sub>0</sub></td><td>0.028(H<sub>0</sub>'/L<sub>0</sub>)<sup>-0.38</sup> exp[20(tan&theta;)<sup>1.5</sup>]</td><td><strong>{f_b0:.3f}</strong></td><td></td></tr>
+                    <tr><td></td><td>&beta;<sub>1</sub></td><td>0.52 exp[4.2 tan&theta;]</td><td><strong>{f_b1:.3f}</strong></td><td></td></tr>
+                    <tr><td></td><td>&beta;<sub>max</sub></td><td>max(0.92, 0.32(H<sub>0</sub>'/L<sub>0</sub>)<sup>-0.29</sup> exp[2.4 tan&theta;])</td><td><strong>{f_bM:.3f}</strong></td><td></td></tr>
+                    <tr><td></td><td>K<sub>s</sub></td><td>비선형 천수계수</td><td><span style="border: 2px solid black; padding: 2px 8px; font-weight:bold;">{final_Ks:.3f}</span></td><td>맞추기</td></tr>
+                    <tr><td></td><td>H<sub>0</sub>'</td><td>환산심해파고 (m)</td><td><span style="border: 2px solid black; padding: 2px 8px; font-weight:bold;">{verified_H0p:.2f}</span></td><td>맞추기</td></tr>
+                    <tr><td></td><td>tan&theta;</td><td>해저경사</td><td><strong>{tan_theta_str}</strong></td><td></td></tr>
+                    <tr><td></td><td>h</td><td>적용 수심 (m)</td><td><strong>{h:.2f}</strong></td><td></td></tr>
+                    <tr><td></td><td>L<sub>0</sub></td><td>심해파장 (m)</td><td><strong>{L0:.2f}</strong></td><td></td></tr>
+                    <tr><td></td><td>h/L<sub>0</sub></td><td>상대 수심</td><td><strong>{d_L0:.3f}</strong></td><td>{cond_str}</td></tr>
+                    <tr><td></td><td>H<sub>0</sub>'/L<sub>0</sub></td><td>환산심해파형경사</td><td><strong>{H0p_L0_val:.3f}</strong></td><td></td></tr>
+                    <tr><td></td><td>조건 1</td><td>&beta;<sub>0</sub>H<sub>0</sub>' + &beta;<sub>1</sub>h</td><td><strong>{f_val1:.2f}</strong></td><td></td></tr>
+                    <tr><td></td><td>조건 2</td><td>&beta;<sub>max</sub>H<sub>0</sub>'</td><td><strong>{f_val2:.2f}</strong></td><td></td></tr>
+                    <tr><td></td><td>조건 3</td><td>K<sub>s</sub>H<sub>0</sub>'</td><td><strong>{f_val3:.2f}</strong></td><td></td></tr>
+                    <tr><td><strong>결과</strong></td><td><strong>H<sub>1/3</sub></strong></td><td><strong>유의파고</strong></td><td><span style="border: 2px solid black; padding: 2px 8px; font-weight:bold; font-size:1.1em;">{final_H13_calc:.2f} m</span></td><td></td></tr>
                 </table>
 
                 <p><strong>⓶ 검증결과</strong></p>
@@ -1133,64 +1132,103 @@ with col2:
 
                 <h4>4) 쇄파 발생 여부 (쇄파 저감) 판단</h4>
                 <div class="box {box_class_2}">
-                    ▶ <strong>상대수심 (\\(h/H_0'\\))</strong> = {h} / {verified_H0p:.4f} = <strong>{h_H0p_val:.4f}</strong><br>
+                    ▶ <strong>상대수심 (h/H<sub>0</sub>')</strong> = {h} / {verified_H0p:.4f} = <strong>{h_H0p_val:.4f}</strong><br>
                     결과: {reason_text_2}
                 </div>
 
                 <h4>5) 해저경사별 쇄파대 최대파고 산정도 판독</h4>
                 <div class="box info-box">
                     <strong>[산정도 판독용 변수]</strong><br>
-                    • 해저경사 (\\(\\tan\\theta\\)) = {tanTheta}<br>
-                    • 환산심해파형경사 (\\(H_0'/L_0\\)) = <strong>{H0p_L0_val:.6f}</strong><br>
-                    • 상대수심 (\\(h/H_0'\\)) = <strong>{h_H0p_val:.4f}</strong>
+                    • 해저경사 (tan&theta;) = {tanTheta}<br>
+                    • 환산심해파형경사 (H<sub>0</sub>'/L<sub>0</sub>) = <strong>{H0p_L0_val:.6f}</strong><br>
+                    • 상대수심 (h/H<sub>0</sub>') = <strong>{h_H0p_val:.4f}</strong>
                 </div>
-                <p>▶ 조건에 해당하는 산정도 곡선 자동 판독 결과: 파고비 (\\(H_{{max}}/H_0'\\)) = <strong>{graph_ratio:.3f}</strong></p>
+                <p>▶ 조건에 해당하는 산정도 곡선 자동 판독 결과: 파고비 (H<sub>max</sub>/H<sub>0</sub>') = <strong>{graph_ratio:.3f}</strong></p>
                 <div class="box success-box">
-                    ▶ <strong>산정도 \\(H_{{max}}\\)</strong> = {graph_ratio:.3f} &times; {verified_H0p:.4f} = <strong>{Hmax_graph:.4f} m</strong>
+                    ▶ <strong>산정도 H<sub>max</sub></strong> = {graph_ratio:.3f} &times; {verified_H0p:.4f} = <strong>{Hmax_graph:.4f} m</strong>
                 </div>
 
-                <div class="box success-box" style="font-size: 13px; border-left-color: #28a745;">
-                    <strong>📌 참고) 항만 및 어항 설계기준의 도표를 이용한 최대파고 산정방법</strong><br>
-                    • 도표에서 우측의 2%감쇄선(일점쇄선)의 우측영역의 파고변화는 천수변형의 천수계수(p.72)를 적용하여 쇄파대내 Hmax 약산식을 사용한다.<br>
-                    • 도표에서 우측의 2%감쇄선(일점쇄선)의 좌측영역은 쇄파에 의한 파고변화가 탁월하므로 도표를 이용하여 산출한다.
-                </div>
-
-                <h4>6) 쇄파대 내 파고 약산식을 이용한 \\(H_{{max}}\\) 산정 (비교 검증용)</h4>
+                <h4>6) 쇄파대 내 파고 약산식을 이용한 H<sub>max</sub> 산정 (비교 검증용)</h4>
                 <ul>
                     <li><strong>① 약산식 계수 산출:</strong><br>
-                        • \\(\\beta_0^*\\) = \\(0.052 \\times (H_0'/L_0)^{{-0.38}} \\times \\exp(20 \\times \\tan\\theta^{{1.5}})\\) = <strong>{b0_s:.6f}</strong><br>
-                        • \\(\\beta_1^*\\) = \\(0.63 \\times \\exp(3.8 \\times \\tan\\theta)\\) = <strong>{b1_s:.6f}</strong><br>
-                        • \\(\\beta_{{max}}^*\\) = \\(\\max[1.65, 0.53 \\times (H_0'/L_0)^{{-0.29}} \\times \\exp(2.4 \\times \\tan\\theta)]\\) = <strong>{bM_s:.6f}</strong>
+                        • &beta;<sub>0</sub><sup>*</sup> = 0.052 &times; (H<sub>0</sub>'/L<sub>0</sub>)<sup>-0.38</sup> &times; exp(20 &times; tan&theta;<sup>1.5</sup>) = <strong>{b0_s:.6f}</strong><br>
+                        • &beta;<sub>1</sub><sup>*</sup> = 0.63 &times; exp(3.8 &times; tan&theta;) = <strong>{b1_s:.6f}</strong><br>
+                        • &beta;<sub>max</sub><sup>*</sup> = max[1.65, 0.53 &times; (H<sub>0</sub>'/L<sub>0</sub>)<sup>-0.29</sup> &times; exp(2.4 &times; tan&theta;)] = <strong>{bM_s:.6f}</strong>
                     </li>
                     <li style="margin-top: 10px;"><strong>② 최대파고 조건별 계산:</strong><br>
-                        • Condition 1: \\(\\beta_0^* H_0' + \\beta_1^* h\\) = <strong>{fv1:.6f} m</strong><br>
-                        • Condition 2: \\(\\beta_{{max}}^* H_0'\\) = <strong>{fv2:.6f} m</strong><br>
-                        • Condition 3: \\(1.8 \\times K_s \\times H_0'\\) = <strong>{fv3:.6f} m</strong>
+                        • Condition 1: &beta;<sub>0</sub><sup>*</sup>H<sub>0</sub>' + &beta;<sub>1</sub><sup>*</sup>h = <strong>{fv1:.6f} m</strong><br>
+                        • Condition 2: &beta;<sub>max</sub><sup>*</sup>H<sub>0</sub>' = <strong>{fv2:.6f} m</strong><br>
+                        • Condition 3: 1.8 &times; K<sub>s</sub> &times; H<sub>0</sub>' = <strong>{fv3:.6f} m</strong>
                     </li>
                 </ul>
                 <div class="box success-box">
-                    ▶ <strong>약산식 \\(H_{{max}}\\)</strong> = \\(\\min\\)(Condition 1, Condition 2, Condition 3) = <strong>{Hmax_form:.6f} m</strong>
+                    ▶ <strong>약산식 H<sub>max</sub></strong> = min(Condition 1, Condition 2, Condition 3) = <strong>{Hmax_form:.6f} m</strong>
                 </div>
 
+                <!-- MS Word 완벽 호환용 페이지 넘김 -->
+                <p style="page-break-before: always; mso-break-type: page-break; clear: both;"></p>
+                
                 <h3>📈 3. 최대파고 산정도 (결과 모사 도표)</h3>
-                <img src="data:image/png;base64,{img_base64}" alt="최대파고 산정도 그래프">
+                
+                <div style="text-align: center;">
+                    <!-- 화면 원본 이미지는 건드리지 않고, 출력되는 Word 문서 안에서만 A4 크기에 맞게 축소 -->
+                    <img src="data:image/png;base64,{img_base64}" alt="최대파고 산정도 그래프" width="450" height="556" style="border: none; max-width: 100%;">
+                </div>
+
             </body>
             </html>
             """
-
+            
             html_report = "\n".join([line.strip() for line in raw_html.splitlines()])
+
+            # 3. ★ MS Word 전용 MHTML (이미지 포함 단일 문서 포맷) 생성 ★
+            # MS Word가 HTML 내부의 base64 이미지를 엑스박스로 처리하는 문제를 해결하기 위해,
+            # 멀티파트 웹 아카이브 형식(MHTML)으로 데이터를 패키징합니다.
+            boundary = "----=_NextPart_HTML_DOC_001"
+            html_for_word = html_report.replace(f"data:image/png;base64,{img_base64}", "cid:chart_image_001")
+            
+            mhtml_report = f"""MIME-Version: 1.0
+Content-Type: multipart/related; type="text/html"; boundary="{boundary}"
+
+--{boundary}
+Content-Type: text/html; charset="utf-8"
+Content-Transfer-Encoding: 8bit
+
+{html_for_word}
+
+--{boundary}
+Content-Type: image/png
+Content-Transfer-Encoding: base64
+Content-ID: <chart_image_001>
+
+{img_base64}
+--{boundary}--"""
 
             st.markdown("---")
             st.markdown("### 📥 상세 보고서 다운로드")
-            st.info("💡 **출력 팁:** 아래 버튼을 눌러 다운로드된 HTML 파일을 인터넷 창에서 연 뒤, 인쇄(Ctrl+P)에서 'PDF로 저장'을 선택하시면 수식, 표, 그래프가 깔끔한 보고서가 완성됩니다.")
+            st.info("💡 **출력 팁:** HTML 파일을 열어 인쇄(Ctrl+P)에서 'PDF로 저장'을 선택하시면 가장 깔끔합니다.\n\n"
+                    "💡 **Word 다운로드:** Word 다운로드 버튼을 누르면 문서 내 그래프 이미지가 정상적으로 삽입된 상태로 편집할 수 있습니다.")
 
-            st.download_button(
-                label="📄 완벽 결과 보고서 다운로드 (HTML)",
-                data=html_report,
-                file_name="최대파고_상세산정보고서.html",
-                mime="text/html",
-                use_container_width=True,
-            )
+            col_btn1, col_btn2 = st.columns(2)
+            
+            with col_btn1:
+                st.download_button(
+                    label="📄 결과 보고서 다운로드 (HTML 웹용)",
+                    data=html_report,
+                    file_name="최대파고_상세산정보고서.html",
+                    mime="text/html",
+                    use_container_width=True,
+                )
+                
+            with col_btn2:
+                # Word가 정상적으로 인식할 수 있도록 MHTML 데이터를 던져주면서 확장자를 .doc로 덮어씌움
+                st.download_button(
+                    label="📝 결과 보고서 다운로드 (MS Word용)",
+                    data=mhtml_report,
+                    file_name="최대파고_상세산정보고서.doc",
+                    mime="application/msword",
+                    use_container_width=True,
+                )
 
     else:
         st.info("좌측에 제원을 확인한 후 '최대파고 계산 및 결과서 생성' 버튼을 클릭하세요.")
