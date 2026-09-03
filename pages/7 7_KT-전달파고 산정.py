@@ -4,6 +4,14 @@ import math
 import os
 import base64
 import re
+import io
+import urllib.request
+import concurrent.futures
+import matplotlib.font_manager as fm
+import matplotlib.pyplot as plt
+
+# ★ 화면 꽉 차게 만들기 (Streamlit 최상단 필수 설정)
+st.set_page_config(page_title="파고 전달율 산정 시스템", layout="wide")
 
 with st.sidebar:
     st.markdown("---")
@@ -12,7 +20,36 @@ with st.sidebar:
     st.caption("© 2026 All rights reserved.")
 
 # =====================================================================
-# ★ 보고서 생성기 (수식/글씨 깨짐 완벽 방지, 표 인덱스 제거 및 중앙정렬)
+# ★ 한글 폰트 설정 (보고서 가독성용)
+# =====================================================================
+@st.cache_resource
+def set_korean_font():
+    font_url = "https://github.com/google/fonts/raw/main/ofl/nanumgothic/NanumGothic-Regular.ttf"
+    font_path = "NanumGothic.ttf"
+    if not os.path.exists(font_path):
+        try: urllib.request.urlretrieve(font_url, font_path)
+        except Exception: pass
+    if os.path.exists(font_path):
+        fm.fontManager.addfont(font_path)
+        plt.rc('font', family='NanumGothic')
+    plt.rcParams['axes.unicode_minus'] = False 
+
+set_korean_font()
+
+# =====================================================================
+# ★ 초고속 수식 이미지 다운로드 캐시 (전역)
+# =====================================================================
+@st.cache_data(show_spinner=False)
+def fetch_equation_image(api_url):
+    try:
+        req = urllib.request.Request(api_url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=5) as response:
+            return base64.b64encode(response.read()).decode('utf-8')
+    except Exception:
+        return None
+
+# =====================================================================
+# ★ 보고서 생성기 
 # =====================================================================
 class ReportBuilder:
     def __init__(self):
@@ -39,8 +76,6 @@ class ReportBuilder:
             .info-box { background-color: #e8f0fe; border-left: 4px solid #1a73e8; padding: 12px; margin: 10px 0; color: #000000; font-weight: 800; }
             .warn-box { background-color: #fff3cd; border-left: 4px solid #ffc107; padding: 12px; margin: 10px 0; color: #000000; font-weight: 800; }
             .figure { text-align: center; margin: 20px 0; }
-            
-            /* 여백 최적화 및 폰트 선명도 강화 */
             .two-col-list { column-count: 2; column-gap: 30px; list-style-position: inside; margin: 5px 0 15px 0; padding-left: 5px; }
             .two-col-list li { margin-bottom: 6px; font-size: 15px; font-weight: 800; color: #000000; }
             .calc-step { background: #fdfdfd; padding: 12px 15px; border-left: 5px solid #4caf50; margin-bottom: 12px; border-radius: 4px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
@@ -77,27 +112,17 @@ class ReportBuilder:
                 
                 sub_content = content[2:].strip()
                 if sub_content.startswith('- '):
-                    if not in_list:
-                        html_out += "<ul>"
-                        in_list = True
+                    if not in_list: html_out += "<ul>"; in_list = True
                     html_out += f"<li>{sub_content[2:]}</li>"
                 else:
-                    if in_list:
-                        html_out += "</ul>"
-                        in_list = False
+                    if in_list: html_out += "</ul>"; in_list = False
                     html_out += f"<p>{sub_content}</p>"
             else:
-                if in_list:
-                    html_out += "</ul>"
-                    in_list = False
-                if in_quote:
-                    html_out += "</div>"
-                    in_quote = False
+                if in_list: html_out += "</ul>"; in_list = False
+                if in_quote: html_out += "</div>"; in_quote = False
                 
                 if content.startswith('- ') or content.startswith('* '):
-                    if not in_list:
-                        html_out += "<ul>"
-                        in_list = True
+                    if not in_list: html_out += "<ul>"; in_list = True
                     html_out += f"<li>{content[2:]}</li>"
                 else:
                     html_out += f"<p>{content}</p>"
@@ -140,7 +165,6 @@ class ReportBuilder:
         self.html += f"<div style='text-align:center;'><span class='final-result'>{text}</span></div><br>"
 
     def df(self, dataframe):
-        # 인덱스 제거(index=False) 및 HTML 테이블 렌더링 (가운데 정렬)
         html_table = dataframe.to_html(index=False, justify='center', escape=False)
         st.markdown(f"<div style='display:flex; justify-content:center; width:100%;'>{html_table}</div>", unsafe_allow_html=True)
         self.html += f"<div style='text-align:center;'>{html_table}</div>"
@@ -150,10 +174,125 @@ class ReportBuilder:
             st.image(img_path, caption=caption)
             with open(img_path, "rb") as f:
                 encoded = base64.b64encode(f.read()).decode('utf-8')
-            self.html += f"<div class='figure'><img src='data:image/png;base64,{encoded}' style='max-width:100%; height:auto; border: 1px solid #ccc;'><p><b>{caption}</b></p></div>"
+            # ★ 워드 그림 찢어짐 방지 처리 완료
+            self.html += f"<div class='figure'><img src='data:image/png;base64,{encoded}' style='max-width:100%; height:auto;'><p><b>{caption}</b></p></div>"
 
     def get_html(self):
         return self.html + "</body></html>"
+
+# =====================================================================
+# ★ 다운로드 렌더링 엔진 (초고속 병렬 + Word 호환)
+# =====================================================================
+def render_fast_download(rep_obj, filename_base):
+    st.divider()
+    st.header("🖨️ 통합 구조계산서 다운로드")
+    st.info("💡 **초고속 병렬 다운로드 엔진 적용:** MS Word 다운로드 시 수식과 삽도가 고해상도로 내장되며, 1~2초 이내에 즉시 생성됩니다.")
+    
+    with st.spinner("Word 보고서용 수식과 그림을 고속 병렬 변환 중입니다..."):
+        import urllib.parse
+        
+        report_html = rep_obj.get_html()
+        word_html = report_html
+        attachments = {}
+        counters = {'img': 0, 'eq': 0}
+
+        word_html = re.sub(r'<script.*?</script>', '', word_html, flags=re.DOTALL)
+        word_html = word_html.replace('<table', '<table style="border-collapse: collapse; width: 100%; border: 1px solid black; margin-bottom: 20px;"')
+        word_html = word_html.replace('<th>', '<th style="border: 1px solid black; padding: 8px; background-color: #f2f2f2; text-align: center;">')
+        word_html = word_html.replace('<td>', '<td style="border: 1px solid black; padding: 8px; text-align: center;">')
+
+        # 이미지 래핑하여 세로로 찢어지는 현상 완벽 방어
+        def image_replacer(match):
+            b64_data = match.group(1)
+            counters['img'] += 1
+            img_id = f"fig_img_{counters['img']}"
+            attachments[img_id] = b64_data
+            return f'<table align="center" style="border-collapse: collapse; border: none; margin: 10px auto;"><tr><td style="border: none; padding: 0; text-align: center;"><img src="cid:{img_id}" width="650"></td></tr></table>'
+        
+        word_html = re.sub(r'<img[^>]+src=[\'"]data:image/png;base64,([^\'"]+)[\'"][^>]*>', image_replacer, word_html)
+
+        display_maths = re.findall(r'\$\$(.*?)\$\$', word_html, flags=re.DOTALL)
+        inline_maths = re.findall(r'\$([^\$]+)\$', word_html)
+        urls_to_fetch = set()
+        
+        def prepare_url(eq_text, is_display):
+            eq_c = re.sub(r'\\text\{([^}]+)\}', lambda m: "" if re.search(r'[가-힣]', m.group(1)) else m.group(0), eq_text)
+            eq_c = eq_c.replace(r'\max', 'max').replace(r'\min', 'min').replace(r'\mathbf', '')
+            dpi = "110" if is_display else "100"
+            return f"https://latex.codecogs.com/png.image?\\dpi{{{dpi}}}\\bg_white&space;{urllib.parse.quote(eq_c)}"
+        
+        for eq in display_maths: urls_to_fetch.add(prepare_url(eq.strip(), True))
+        for eq in inline_maths:
+            txt = eq.strip()
+            if any(op in txt for op in ["\\", "=", "+", "-", "/", "times", "ge", "le", "<", ">", "^", "_"]):
+                urls_to_fetch.add(prepare_url(txt, False))
+                
+        with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
+            list(executor.map(fetch_equation_image, urls_to_fetch))
+
+        def render_math_to_img(eq_text, is_display):
+            korean_parts = []
+            def kr_replacer(m):
+                txt = m.group(1)
+                if re.search(r'[가-힣]', txt):
+                    korean_parts.append(txt)
+                    return ""
+                return m.group(0)
+            eq_c = re.sub(r'\\text\{([^}]+)\}', kr_replacer, eq_text)
+            eq_c = eq_c.replace(r'\max', 'max').replace(r'\min', 'min').replace(r'\mathbf', '')
+            
+            api_url = prepare_url(eq_text, is_display)
+            counters['eq'] += 1
+            img_id = f"eq_img_{counters['eq']}"
+            b64_img = fetch_equation_image(api_url)
+            
+            if b64_img:
+                attachments[img_id] = b64_img
+                img_tag = f"<img src='cid:{img_id}' style='vertical-align: middle; border: none; max-width: 100%;'>"
+            else:
+                img_tag = f"<img src='{api_url}' style='vertical-align: middle; border: none; max-width: 100%;'>"
+            
+            kr_addon = f"<span style='margin-left:5px; font-weight:bold; color:#555;'>[{' '.join(korean_parts)}]</span>" if korean_parts else ""
+            return img_tag, kr_addon
+
+        def display_math_replacer(match):
+            img_tag, kr_addon = render_math_to_img(match.group(1).strip(), True)
+            return f'<table align="center" style="border-collapse: collapse; border: none; margin: 10px auto; width: 100%;"><tr><td style="border: none; padding: 0; text-align: center;">{img_tag} {kr_addon}</td></tr></table>'
+        word_html = re.sub(r'\$\$(.*?)\$\$', display_math_replacer, word_html, flags=re.DOTALL)
+
+        def inline_math_replacer(match):
+            eq_text = match.group(1).strip()
+            if any(op in eq_text for op in ["\\", "=", "+", "-", "/", "times", "ge", "le", "<", ">", "^", "_"]):
+                img_tag, kr_addon = render_math_to_img(eq_text, False)
+                return f"{img_tag}{kr_addon}"
+            else:
+                return f"${eq_text}$"
+        word_html = re.sub(r'\$([^\$]+)\$', inline_math_replacer, word_html)
+
+        # 잔여 첨자(기호) 강제 치환
+        word_html = word_html.replace("$H_{1/3}$", "H<sub>1/3</sub>").replace("$T_z$", "T<sub>z</sub>").replace("$h_{1/3, peak}$", "h<sub>1/3, peak</sub>")
+        word_html = word_html.replace("$H_0'$", "H<sub>0</sub>'").replace("$H_s$", "H<sub>s</sub>").replace("$T_{1/3}$", "T<sub>1/3</sub>")
+        word_html = word_html.replace("$\\Delta$", "Δ").replace("$\\alpha$", "α").replace("$\\alpha_s$", "α<sub>s</sub>").replace("$\\alpha_{row}$", "α<sub>row</sub>")
+        word_html = word_html.replace("$K_T$", "K<sub>T</sub>").replace("$H_T$", "H<sub>T</sub>").replace("$L_{1/3}$", "L<sub>1/3</sub>")
+        word_html = word_html.replace("$R_c$", "R<sub>c</sub>").replace("$A_T$", "A<sub>T</sub>").replace("$h_s$", "h<sub>s</sub>")
+        word_html = word_html.replace("$D_n$", "D<sub>n</sub>")
+        word_html = re.sub(r'\$([a-zA-Z]+)_([a-zA-Z0-9\+\-]+)\$', r'\1<sub>\2</sub>', word_html)
+        word_html = word_html.replace('$', '')
+
+        boundary = "----=_NextPart_HTML_DOC_001"
+        mhtml = f'MIME-Version: 1.0\nContent-Type: multipart/related; type="text/html"; boundary="{boundary}"\n\n'
+        mhtml += f'--{boundary}\nContent-Type: text/html; charset="utf-8"\nContent-Transfer-Encoding: 8bit\n\n'
+        mhtml += word_html + "\n\n"
+        
+        for cid, b64 in attachments.items():
+            mhtml += f'--{boundary}\nContent-Type: image/png\nContent-Transfer-Encoding: base64\nContent-ID: <{cid}>\n\n{b64}\n\n'
+        mhtml += f"--{boundary}--\n"
+        
+    col1, col2 = st.columns(2)
+    with col1:
+        st.download_button("📄 전달파고 산정 보고서 다운로드 (HTML 웹용)", data=report_html.encode('utf-8'), file_name=f"{filename_base}.html", mime="text/html", use_container_width=True)
+    with col2:
+        st.download_button("📝 전달파고 산정 보고서 다운로드 (MS Word용)", data=mhtml.encode('utf-8'), file_name=f"{filename_base}.doc", mime="application/msword", use_container_width=True)
 
 # =====================================================================
 # 1. 물리 계산 코어 엔진 
@@ -284,39 +423,13 @@ class TransmissionCalc:
 # =====================================================================
 # 3. Streamlit UI 메인
 # =====================================================================
-st.set_page_config(page_title="파고 전달율 산정 시스템", layout="wide")
-
-# ★ Streamlit UI 글씨 선명도 최적화 CSS (투명도 제거 및 폰트 굵기 강제 지정)
 st.markdown("""
 <style>
-    /* 전체 컨테이너 및 표 글자 선명하게 강제 적용 */
-    [data-testid="stMarkdownContainer"] {
-        color: #000000 !important; font-weight: 800 !important; opacity: 1 !important;
-    }
-    
-    /* 상세풀이 박스(인용구) 투명도 필터 완벽 제거 */
-    [data-testid="stMarkdownContainer"] blockquote {
-        background-color: #f9f9f9 !important; padding: 15px 20px !important; 
-        border-left: 6px solid #1a73e8 !important; margin-bottom: 15px !important;
-        box-shadow: 0px 2px 4px rgba(0,0,0,0.15); border-radius: 4px;
-        opacity: 1 !important;
-    }
-    [data-testid="stMarkdownContainer"] blockquote p,
-    [data-testid="stMarkdownContainer"] blockquote li,
-    [data-testid="stMarkdownContainer"] blockquote span {
-        color: #000000 !important; font-size: 16.5px !important; font-weight: 900 !important; 
-        margin-bottom: 8px !important; line-height: 1.7 !important;
-        opacity: 1 !important;
-    }
-    [data-testid="stMarkdownContainer"] blockquote ul {
-        margin-top: 5px !important; margin-bottom: 10px !important;
-        opacity: 1 !important;
-    }
-    
-    /* 수식 폰트 강제 선명화 */
+    [data-testid="stMarkdownContainer"] { color: #000000 !important; font-weight: 800 !important; opacity: 1 !important; }
+    [data-testid="stMarkdownContainer"] blockquote { background-color: #f9f9f9 !important; padding: 15px 20px !important; border-left: 6px solid #1a73e8 !important; margin-bottom: 15px !important; box-shadow: 0px 2px 4px rgba(0,0,0,0.15); border-radius: 4px; opacity: 1 !important; }
+    [data-testid="stMarkdownContainer"] blockquote p, [data-testid="stMarkdownContainer"] blockquote li, [data-testid="stMarkdownContainer"] blockquote span { color: #000000 !important; font-size: 16.5px !important; font-weight: 900 !important; margin-bottom: 8px !important; line-height: 1.7 !important; opacity: 1 !important; }
+    [data-testid="stMarkdownContainer"] blockquote ul { margin-top: 5px !important; margin-bottom: 10px !important; opacity: 1 !important; }
     .katex, .katex * { color: #000000 !important; font-weight: 900 !important; opacity: 1 !important; }
-    
-    /* 결과 표 테두리 및 텍스트 굵게 강제 적용 */
     table { width: 100%; border: 2px solid #000 !important; border-collapse: collapse; margin-bottom: 20px; opacity: 1 !important; }
     th { background-color: #e0e0e0 !important; color: #000 !important; font-weight: 900 !important; font-size: 16px !important; border: 1px solid #000 !important; padding: 10px; text-align: center; }
     td { color: #000 !important; font-weight: 900 !important; font-size: 15px !important; border: 1px solid #000 !important; padding: 10px; text-align: center; }
@@ -383,9 +496,15 @@ elif c_type == "수중구조물 (잠제, 인공리프)":
         default_at = 5.0 if sub_type == "투과형 단면" else 4.0
         at_val = st.sidebar.number_input("피복층 두께 A_T (m)", value=default_at, key='u_at')
 
+if 'kt_calculated' not in st.session_state:
+    st.session_state['kt_calculated'] = False
+
 calc_btn = st.sidebar.button("🚀 전달파고 산정 및 보고서 생성", use_container_width=True, type="primary")
 
 if calc_btn:
+    st.session_state['kt_calculated'] = True
+
+if st.session_state['kt_calculated']:
     rep = ReportBuilder()
     rep.title(f"📑 {c_type} 파고 전달율($K_T$) 및 전달파고($H_T$) 산정", level=2)
 
@@ -582,10 +701,4 @@ if calc_btn:
     }])
     rep.df(df_summary)
 
-    st.divider()
-    st.download_button(
-        label="📄 전달파고 산정 보고서 다운로드 (.html)",
-        data=rep.get_html(),
-        file_name=f"전달파고_산정보고서_{'수중구조물' if '수중' in c_type else '방파제'}.html",
-        mime="text/html"
-    )
+    render_fast_download(rep, f"전달파고_산정보고서_{'수중구조물' if '수중' in c_type else '방파제'}")
