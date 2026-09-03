@@ -8,6 +8,10 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 import io
 import base64
+import re
+import urllib.parse
+import concurrent.futures
+import textwrap
 
 with st.sidebar:
     st.markdown("---")
@@ -79,12 +83,22 @@ class ReportBuilder:
         self.html += html_out
 
     def latex(self, eq):
-        self.html += f"<div class='eq'>$$ {eq} $$</div>"
+        # MS Word 호환성을 위해 수식을 직접 Matplotlib 이미지로 변환하여 삽입
+        try:
+            fig, ax = plt.subplots(figsize=(10, 1.2))
+            ax.axis('off')
+            ax.text(0.5, 0.5, f"${eq}$", fontsize=16, ha='center', va='center', math_fontfamily='cm')
+            buf = io.BytesIO()
+            plt.savefig(buf, format='png', bbox_inches='tight', dpi=200, transparent=True)
+            plt.close(fig)
+            buf.seek(0)
+            img_b64 = base64.b64encode(buf.read()).decode('utf-8')
+            self.html += f"<div class='eq' style='text-align:center; background:#fdfefe; padding:15px; border-left:4px solid #1a73e8; border:1px solid #e0e0e0; margin:15px 0;'><img src='data:image/png;base64,{img_b64}' width='600' style='max-width:100%; height:auto;'></div>"
+        except Exception:
+            self.html += f"<div class='eq'>$$ {eq} $$</div>"
 
     def table(self, dataframe, styled=None):
-        html_table = styled.to_html(justify='center') if styled is not None else dataframe.to_html(index=False,
-                                                                                                   justify='center',
-                                                                                                   escape=False)
+        html_table = styled.to_html(justify='center') if styled is not None else dataframe.to_html(index=False, justify='center', escape=False)
         self.html += html_table.replace('\\n', '<br>')
 
     def html_raw(self, raw_html):
@@ -92,6 +106,42 @@ class ReportBuilder:
 
     def get_html(self):
         return self.html + "</body></html>"
+
+    def get_mhtml(self):
+        word_html = self.get_html()
+        attachments = {}
+        counters = {'img': 0}
+
+        word_html = re.sub(r'<script.*?</script>', '', word_html, flags=re.DOTALL)
+        
+        # Base64 이미지 변환
+        def image_replacer(match):
+            b64_data = match.group(1)
+            counters['img'] += 1
+            img_id = f"embedded_img_{counters['img']}"
+            attachments[img_id] = b64_data
+            return f'<img src="cid:{img_id}" width="650">'
+        
+        word_html = re.sub(r'src=["\']data:image/[a-zA-Z]+;base64,([^\'"]+)["\']', image_replacer, word_html)
+
+        # 본문 설명 내 인라인 수식 기호를 Word에서 깨지지 않는 특수문자로 치환
+        word_html = word_html.replace(r'\gamma_R', 'γ_R').replace(r'\gamma_m', 'γ_m').replace(r'\gamma_S', 'γ_S').replace(r'\phi_s', 'Φ_s').replace(r'\phi_o', 'Φ_o').replace(r'\phi_b', 'Φ_b')
+        word_html = word_html.replace(r'\le', '≤').replace(r'\ge', '≥').replace(r'\cdot', '·').replace(r'\sum', 'Σ').replace(r'\_', '_')
+        word_html = re.sub(r'\$([^\$]+)\$', r'<i>\1</i>', word_html)
+
+        boundary = "----=_NextPart_HTML_DOC_001"
+        mhtml = f'MIME-Version: 1.0\nContent-Type: multipart/related; type="text/html"; boundary="{boundary}"\n\n'
+        mhtml += f'--{boundary}\nContent-Type: text/html; charset="utf-8"\nContent-Transfer-Encoding: 8bit\n\n'
+        
+        mhtml_body = word_html.replace("<html", "<html xmlns:o='urn:schemas-microsoft-com:office:office' xmlns:w='urn:schemas-microsoft-com:office:word'")
+        mhtml_body = mhtml_body.replace("<head>", "<head><meta http-equiv='Content-Type' content='text/html; charset=utf-8'>")
+        
+        mhtml += mhtml_body + "\n\n"
+        for cid, b64 in attachments.items():
+            formatted_b64 = '\n'.join(textwrap.wrap(b64, 76))
+            mhtml += f'--{boundary}\nContent-Type: image/png\nContent-Transfer-Encoding: base64\nContent-ID: <{cid}>\n\n{formatted_b64}\n\n'
+        mhtml += f"--{boundary}--\n"
+        return mhtml
 
 
 # =====================================================================
@@ -330,10 +380,10 @@ st.markdown("<h1 style='text-align:center;'>🧱 블록식 안벽 상세 구조�
 st.caption("※ 케이스별(상재하중 토압/자중 적용 여부) 하중조합 자동 연산 및 상세 출력 지원")
 
 # =====================================================================
-# ★ 5번 홈(Home) 화면 앱 사용설명서 추가 영역 (블록식 안벽 신뢰성 설계법 상세 구조계산서 자동화 검토 프로그램)
+# ★ 16번 홈(Home) 화면 앱 사용설명서 추가 영역 (블록식 안벽 신뢰성 설계법 상세 구조계산서 자동화 검토 프로그램)
 # =====================================================================
 st.markdown("""
-5. **5_WB_Reliability**: 블록식 안벽 신뢰성 설계법 상세 구조계산서 자동화 검토 프로그램[cite: 1] 2026.8.13 수정완료(항만설계사례집 단면 적용)
+16. **16_WB_Reliability**: 블록식 안벽 신뢰성 설계법 상세 구조계산서 자동화 검토 프로그램[cite: 1] 2026.8.12 1차 수정(항만설계사례집 단면 적용)-돌출이 단별로 변할떄 추가수정중
 """)
 
 with st.expander("👉 블록식 안벽 신뢰성 설계법 상세 구조계산서 자동화 시스템 앱 사용설명서 보기"):
@@ -394,7 +444,23 @@ with st.expander("👉 블록식 안벽 신뢰성 설계법 상세 구조계산�
     * **본 프로그램의 적용 방식 (항만시설물 설계사례집 준용):**
       * 『항만시설물 설계사례집(상권)』에 따라 평상시 및 지진시 모두 **벽면마찰각 $\delta = 0$ (랜킨토압 준용)**을 일관되게 적용하였습니다.
       * 이 경우 지진시 다소 보수적(안전측)으로 평가되어 경제성 측면에서는 불리할 수 있으나, 사례집 준용을 통한 안정성 검토의 통일성을 확보하도록 구현되었습니다.
+    ---
+
+    ### **Ⅳ. 검증단면**
     """)
+
+    # 이미지를 2열로 배치
+    col1, col2 = st.columns(2)
+    with col1:
+        st.image("검증단면 1.png", use_container_width=True)
+    with col2:
+        st.image("검증단면 2.png", use_container_width=True)
+        
+    col3, col4 = st.columns(2)
+    with col3:
+        st.image("검증단면 3.png", use_container_width=True)
+    with col4:
+        st.image("검증단면 4.png", use_container_width=True)
 
 st.sidebar.header("📁 해석 모드 및 수위 조건")
 calc_mode = st.sidebar.radio("해석 모드 선택", ["평상시 (Normal)", "지진시 (Earthquake)"], index=0)
@@ -1355,70 +1421,56 @@ def generate_earth_pressure_html(tiers_df, ka, q_val, rwl, c_top, g_wet, g_sub, 
         html += "</table>"
         html += "</div>"
 
-        svg_height = 420;
-        svg_width = 340
-        html += f"<div style='flex: 1.0; background: #fff; border: 1px solid #bbb; padding: 5px; text-align: center; overflow-x: auto;'>"
-        html += f"<div style='font-size:12px; font-weight:bold; margin-bottom:5px; color:#444;'>토압강도도 (단위: kN/m²)</div>"
-        html += f"<svg width='{svg_width}' height='{svg_height}' style='font-family:sans-serif; font-size:11px;'>"
-
-        max_pa = max([n["pa"] for n in nodes]) if nodes else 35.0
-        scale_x = 180 / max_pa if max_pa > 0 else 1
-        origin_x = 85
-
+        # ★ Word 호환을 위한 Matplotlib Base64 이미지 변환 적용 (토압강도도)
+        fig, ax = plt.subplots(figsize=(2.5, 3.5))
         el_max = nodes[0]["el"]
         el_min = nodes[-1]["el"]
         el_range = el_max - el_min if el_max != el_min else 1.0
-        draw_height = 360.0
-
-        def get_y(el):
-            return 20 + (el_max - el) / el_range * draw_height
-
-        pts = ""
-        for n in nodes:
-            y_pos = get_y(n["el"])
-            x_pos = origin_x + n["pa"] * scale_x
-            pts += f"{x_pos},{y_pos} "
-        last_y = get_y(el_min)
-        top_y = get_y(el_max)
-        pts += f"{origin_x},{last_y} {origin_x},{top_y}"
-
-        html += f"<polygon points='{pts}' fill='#f0f4f8' stroke='#2c3e50' stroke-width='1.5'/>"
-        html += f"<line x1='{origin_x}' y1='{top_y}' x2='{origin_x}' y2='{last_y}' stroke='black' stroke-width='2'/>"
-
+        max_pa = max([n["pa"] for n in nodes]) if nodes else 35.0
+        
+        y_vals = [n["el"] for n in nodes]
+        x_vals = [n["pa"] for n in nodes]
+        
+        ax.fill_betweenx(y_vals, 0, x_vals, facecolor='#f0f4f8', edgecolor='#2c3e50', linewidth=1.5)
+        ax.plot([0, 0], [el_min, el_max], color='black', linewidth=2)
+        
         for i, n in enumerate(nodes):
-            y_pos = get_y(n["el"])
-            level_str = f"({'+' if n['el'] >= 0 else '-'}){abs(n['el']):.3f}"
+            y_pos = n["el"]
             pa_val = n["pa"]
-
-            is_duplicate_el = (i > 0 and nodes[i - 1]['el'] == n['el'])
-
+            level_str = f"({'+' if y_pos >= 0 else '-'}){abs(y_pos):.3f}"
+            is_duplicate_el = (i > 0 and abs(nodes[i - 1]['el'] - y_pos) < 0.001)
+            
             if not is_duplicate_el:
-                html += f"<text x='{origin_x - 8}' y='{y_pos + 4}' text-anchor='end' font-size='10' font-weight='bold'>{level_str}</text>"
-                html += f"<line x1='{origin_x - 5}' y1='{y_pos}' x2='{origin_x}' y2='{y_pos}' stroke='black'/>"
-            else:
-                html += f"<line x1='{origin_x - 3}' y1='{y_pos}' x2='{origin_x}' y2='{y_pos}' stroke='black' stroke-width='1'/>"
-
-            x_pos = origin_x + pa_val * scale_x
-
-            text_y_offset = 3
-            if is_duplicate_el:
-                text_y_offset = 12
-            elif i < len(nodes) - 1 and nodes[i + 1]['el'] == n['el']:
-                text_y_offset = -5
-
-            html += f"<line x1='{origin_x}' y1='{y_pos}' x2='{x_pos}' y2='{y_pos}' stroke='#1a73e8' stroke-width='1'/>"
-            html += f"<polygon points='{origin_x},{y_pos} {origin_x + 6},{y_pos - 3} {origin_x + 6},{y_pos + 3}' fill='#1a73e8'/>"
-
-            val_text = f"{pa_val:.2f}"
-            html += f"<text x='{x_pos + 6}' y='{y_pos + text_y_offset}' font-size='10' fill='#d35400' font-weight='bold'>{val_text}</text>"
-
+                ax.text(-max_pa * 0.05, y_pos, level_str, ha='right', va='center', fontsize=8, fontweight='bold')
+                
+            if pa_val > 0.001:
+                ax.annotate("", xy=(pa_val, y_pos), xytext=(0, y_pos), arrowprops=dict(arrowstyle="->", color="#1a73e8", lw=1))
+                va_align = 'bottom' if is_duplicate_el else ('top' if i < len(nodes)-1 and abs(nodes[i+1]['el']-y_pos)<0.001 else 'center')
+                ax.text(pa_val + max_pa * 0.05, y_pos, f"{pa_val:.2f}", color='#d35400', fontsize=8, fontweight='bold', va=va_align)
+            elif not is_duplicate_el:
+                ax.text(max_pa * 0.05, y_pos, "0.00", color='#d35400', fontsize=8, fontweight='bold', va='center')
+                
             if i < len(nodes) - 1:
-                next_y = get_y(nodes[i + 1]['el'])
-                if next_y > y_pos + 1:
-                    mid_y = (y_pos + next_y) / 2
-                    html += f"<text x='{origin_x + 15}' y='{mid_y + 3}' font-size='10' fill='#555'>{i + 1}</text>"
+                next_y = nodes[i + 1]['el']
+                if abs(y_pos - next_y) > 0.001:
+                    mid_y = (y_pos + next_y) / 2.0
+                    ax.text(max_pa * 0.15, mid_y, str(i + 1), color='#555', fontsize=8, va='center')
+        
+        ax.set_ylim(el_min - el_range * 0.05, el_max + el_range * 0.05)
+        ax.set_xlim(-max_pa * 0.4, max_pa * 1.4)
+        ax.axis('off')
+        
+        buf = io.BytesIO()
+        fig.savefig(buf, format='png', bbox_inches='tight', dpi=150)
+        plt.close(fig)
+        buf.seek(0)
+        img_b64 = base64.b64encode(buf.read()).decode('utf-8')
+        
+        html += f"<div style='flex: 1.0; background: #fff; border: 1px solid #bbb; padding: 5px; text-align: center; overflow-x: auto;'>"
+        html += f"<div style='font-size:12px; font-weight:bold; margin-bottom:5px; color:#444;'>토압강도도 (단위: kN/m²)</div>"
+        html += f"<img src='data:image/png;base64,{img_b64}' style='max-width:100%; height:auto;'>"
+        html += "</div></div>"
 
-        html += "</svg></div></div>"
 
         html += f"<div style='margin-top: 15px; margin-bottom: 25px;'>"
         html += "<table style='width:100%; border-collapse: collapse; text-align:center; border: 2px solid #333; font-size:12px;'>"
@@ -1584,58 +1636,55 @@ def generate_earth_pressure_html(tiers_df, ka, q_val, rwl, c_top, g_wet, g_sub, 
             html += "</tr>"
         html += "</table></div>"
 
-        svg_height = 420;
-        svg_width = 340
-        html += f"<div style='flex: 1.0; background: #fff; border: 1px solid #bbb; padding: 5px; text-align: center; overflow-x: auto;'>"
-        html += f"<div style='font-size:12px; font-weight:bold; margin-bottom:5px; color:#444;'>토압강도도 (단위: kN/m²)</div>"
-        html += f"<svg width='{svg_width}' height='{svg_height}' style='font-family:sans-serif; font-size:11px;'>"
-
-        max_pa = max([n["pa"] for n in nodes]) if nodes else 35.0
-        scale_x = 180 / max_pa if max_pa > 0 else 1
-        origin_x = 85
-
+        # ★ Word 호환을 위한 Matplotlib Base64 이미지 변환 적용 (토압강도도)
+        fig, ax = plt.subplots(figsize=(2.5, 3.5))
         el_max = nodes[0]["el"]
         el_min = nodes[-1]["el"]
         el_range = el_max - el_min if el_max != el_min else 1.0
-        draw_height = 360.0
-
-        def get_y_normal(el):
-            return 20 + (el_max - el) / el_range * draw_height
-
-        pts = ""
-        for n in nodes:
-            y_pos = get_y_normal(n["el"])
-            x_pos = origin_x + n["pa"] * scale_x
-            pts += f"{x_pos},{y_pos} "
-        last_y = get_y_normal(el_min)
-        top_y = get_y_normal(el_max)
-        pts += f"{origin_x},{last_y} {origin_x},{top_y}"
-
-        html += f"<polygon points='{pts}' fill='#f0f4f8' stroke='#2c3e50' stroke-width='1.5'/>"
-        html += f"<line x1='{origin_x}' y1='{top_y}' x2='{origin_x}' y2='{last_y}' stroke='black' stroke-width='2'/>"
-
+        max_pa = max([n["pa"] for n in nodes]) if nodes else 35.0
+        
+        y_vals = [n["el"] for n in nodes]
+        x_vals = [n["pa"] for n in nodes]
+        
+        ax.fill_betweenx(y_vals, 0, x_vals, facecolor='#f0f4f8', edgecolor='#2c3e50', linewidth=1.5)
+        ax.plot([0, 0], [el_min, el_max], color='black', linewidth=2)
+        
         for i, n in enumerate(nodes):
-            y_pos = get_y_normal(n["el"])
-            level_str = f"({'+' if n['el'] >= 0 else '-'}){abs(n['el']):.3f}"
+            y_pos = n["el"]
             pa_val = n["pa"]
-
-            html += f"<text x='{origin_x - 8}' y='{y_pos + 4}' text-anchor='end' font-size='10' font-weight='bold'>{level_str}</text>"
-            html += f"<line x1='{origin_x - 5}' y1='{y_pos}' x2='{origin_x}' y2='{y_pos}' stroke='black'/>"
-
-            x_pos = origin_x + pa_val * scale_x
-            html += f"<line x1='{origin_x}' y1='{y_pos}' x2='{x_pos}' y2='{y_pos}' stroke='#1a73e8' stroke-width='1'/>"
-            html += f"<polygon points='{origin_x},{y_pos} {origin_x + 6},{y_pos - 3} {origin_x + 6},{y_pos + 3}' fill='#1a73e8'/>"
-
-            val_text = f"{pa_val:.2f}"
-            html += f"<text x='{x_pos + 6}' y='{y_pos + 3}' font-size='10' fill='#d35400' font-weight='bold'>{val_text}</text>"
-
+            level_str = f"({'+' if y_pos >= 0 else '-'}){abs(y_pos):.3f}"
+            is_duplicate_el = (i > 0 and abs(nodes[i - 1]['el'] - y_pos) < 0.001)
+            
+            if not is_duplicate_el:
+                ax.text(-max_pa * 0.05, y_pos, level_str, ha='right', va='center', fontsize=8, fontweight='bold')
+                
+            if pa_val > 0.001:
+                ax.annotate("", xy=(pa_val, y_pos), xytext=(0, y_pos), arrowprops=dict(arrowstyle="->", color="#1a73e8", lw=1))
+                va_align = 'bottom' if is_duplicate_el else ('top' if i < len(nodes)-1 and abs(nodes[i+1]['el']-y_pos)<0.001 else 'center')
+                ax.text(pa_val + max_pa * 0.05, y_pos, f"{pa_val:.2f}", color='#d35400', fontsize=8, fontweight='bold', va=va_align)
+            elif not is_duplicate_el:
+                ax.text(max_pa * 0.05, y_pos, "0.00", color='#d35400', fontsize=8, fontweight='bold', va='center')
+                
             if i < len(nodes) - 1:
-                next_y = get_y_normal(nodes[i + 1]['el'])
-                if next_y > y_pos + 1:
-                    mid_y = (y_pos + next_y) / 2
-                    html += f"<text x='{origin_x + 15}' y='{mid_y + 3}' font-size='10' fill='#555'>{i + 1}</text>"
-
-        html += "</svg></div></div>"
+                next_y = nodes[i + 1]['el']
+                if abs(y_pos - next_y) > 0.001:
+                    mid_y = (y_pos + next_y) / 2.0
+                    ax.text(max_pa * 0.15, mid_y, str(i + 1), color='#555', fontsize=8, va='center')
+        
+        ax.set_ylim(el_min - el_range * 0.05, el_max + el_range * 0.05)
+        ax.set_xlim(-max_pa * 0.4, max_pa * 1.4)
+        ax.axis('off')
+        
+        buf = io.BytesIO()
+        fig.savefig(buf, format='png', bbox_inches='tight', dpi=150)
+        plt.close(fig)
+        buf.seek(0)
+        img_b64 = base64.b64encode(buf.read()).decode('utf-8')
+        
+        html += f"<div style='flex: 1.0; background: #fff; border: 1px solid #bbb; padding: 5px; text-align: center; overflow-x: auto;'>"
+        html += f"<div style='font-size:12px; font-weight:bold; margin-bottom:5px; color:#444;'>토압강도도 (단위: kN/m²)</div>"
+        html += f"<img src='data:image/png;base64,{img_b64}' style='max-width:100%; height:auto;'>"
+        html += "</div></div>"
 
         html += f"<div style='margin-top: 15px;'>"
         html += "<table style='width:100%; border-collapse: collapse; text-align:center; border: 2px solid #333; font-size:12px;'>"
@@ -1745,58 +1794,51 @@ def generate_water_pressure_html(tiers_df, hwl, llw, rwl, c_top, g_w=10.0):
     bot_el_last = c_top - tiers_df["높이 H(m)"].astype(float).sum()
 
     # -----------------------------------------------------------------
-    # ★ 잔류수압 분포도 (SVG) 생성 로직
+    # ★ 잔류수압 분포도 (PNG 이미지) 생성 로직 (MS Word 완벽 호환)
     # -----------------------------------------------------------------
-    svg_width = 340
-    svg_height = 190  # 🔹 높이를 320에서 190으로 줄여 왼쪽 표와 균형을 맞춤
-    origin_x = 85
-
-    # 🔹 위쪽 여백을 자르기 위해 c_top(구조물 상단)을 제외하고 rwl(잔류수위) 기준으로 상단 높이 설정
+    fig, ax = plt.subplots(figsize=(2.5, 2.5))
     el_max = rwl + 0.5
-
     el_min = bot_el_last - 0.5
     el_range = el_max - el_min if el_max != el_min else 1.0
-    draw_height = svg_height - 40
 
-    def get_y(el):
-        return 20 + (el_max - el) / el_range * draw_height
+    y_vals = [rwl, llw, bot_el_last]
+    x_vals = [0.0, max_pw, max_pw]
 
-    y_rwl = get_y(rwl)
-    y_llw = get_y(llw)
-    y_bot = get_y(bot_el_last)
-
-    scale_x = 150 / max_pw if max_pw > 0 else 1.0
-    x_max = origin_x + max_pw * scale_x
-
-    pts = f"{origin_x},{y_rwl} {x_max},{y_llw} {x_max},{y_bot} {origin_x},{y_bot}"
-
-    svg_html = f"<div style='font-size:12px; font-weight:bold; margin-bottom:5px; color:#444;'>잔류수압 분포도 (단위: kN/m²)</div>"
-    svg_html += f"<svg width='{svg_width}' height='{svg_height}' style='font-family:sans-serif; font-size:11px;'>"
-    svg_html += f"<polygon points='{pts}' fill='#e1f5fe' stroke='#0277bd' stroke-width='1.5'/>"
-    svg_html += f"<line x1='{origin_x}' y1='{10}' x2='{origin_x}' y2='{svg_height - 10}' stroke='black' stroke-width='2'/>"
+    ax.fill_betweenx(y_vals, 0, x_vals, facecolor='#e1f5fe', edgecolor='#0277bd', linewidth=1.5)
+    ax.plot([0, 0], [el_min, el_max], color='black', linewidth=2)
 
     nodes_wp = [
-        {"el": rwl, "pw": 0.0, "y": y_rwl, "is_llw": False},
-        {"el": llw, "pw": max_pw, "y": y_llw, "is_llw": True},
-        {"el": bot_el_last, "pw": max_pw, "y": y_bot, "is_llw": False}
+        {"el": rwl, "pw": 0.0, "is_llw": False},
+        {"el": llw, "pw": max_pw, "is_llw": True},
+        {"el": bot_el_last, "pw": max_pw, "is_llw": False}
     ]
 
     for n in nodes_wp:
-        level_str = f"({'+' if n['el'] >= 0 else '-'}){abs(n['el']):.3f}"
-        svg_html += f"<text x='{origin_x - 8}' y='{n['y'] + 4}' text-anchor='end' font-size='10' font-weight='bold'>{level_str}</text>"
-        svg_html += f"<line x1='{origin_x - 5}' y1='{n['y']}' x2='{origin_x}' y2='{n['y']}' stroke='black'/>"
-
-        x_pos = origin_x + n['pw'] * scale_x
-        if n['pw'] > 0:
-            svg_html += f"<line x1='{origin_x}' y1='{n['y']}' x2='{x_pos}' y2='{n['y']}' stroke='#0277bd' stroke-width='1' stroke-dasharray='2,2'/>"
-            svg_html += f"<polygon points='{origin_x},{n['y']} {origin_x + 6},{n['y'] - 3} {origin_x + 6},{n['y'] + 3}' fill='#0277bd'/>"
-
-            y_text = n['y'] + 12 if n['is_llw'] else n['y'] + 4
-            svg_html += f"<text x='{x_pos + 6}' y='{y_text}' font-size='10' fill='#d35400' font-weight='bold'>{n['pw']:.2f}</text>"
+        y_pos = n['el']
+        pw_val = n['pw']
+        level_str = f"({'+' if y_pos >= 0 else '-'}){abs(y_pos):.3f}"
+        
+        ax.text(-max_pw * 0.05, y_pos, level_str, ha='right', va='center', fontsize=9, fontweight='bold')
+        
+        if pw_val > 0.001:
+            ax.annotate("", xy=(pw_val, y_pos), xytext=(0, y_pos), arrowprops=dict(arrowstyle="->", color="#0277bd", lw=1))
+            va_align = 'top' if n['is_llw'] else 'bottom'
+            ax.text(pw_val + max_pw * 0.05, y_pos, f"{pw_val:.2f}", color='#d35400', fontsize=9, fontweight='bold', va=va_align)
         else:
-            svg_html += f"<text x='{origin_x + 6}' y='{n['y'] + 4}' font-size='10' fill='#d35400' font-weight='bold'>0.00</text>"
+            ax.text(max_pw * 0.05, y_pos, "0.00", color='#d35400', fontsize=9, fontweight='bold', va='center')
 
-    svg_html += "</svg>"
+    ax.set_ylim(el_min - el_range * 0.05, el_max + el_range * 0.05)
+    ax.set_xlim(-max_pw * 0.4, max_pw * 1.4)
+    ax.axis('off')
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format='png', bbox_inches='tight', dpi=150)
+    plt.close(fig)
+    buf.seek(0)
+    img_b64 = base64.b64encode(buf.read()).decode('utf-8')
+
+    svg_html = f"<div style='font-size:12px; font-weight:bold; margin-bottom:5px; color:#444;'>잔류수압 분포도 (단위: kN/m²)</div>"
+    svg_html += f"<img src='data:image/png;base64,{img_b64}' style='max-width:100%; height:auto;'>"
 
     # -----------------------------------------------------------------
     # ★ 2. 잔류수압 표 (줄간격 넓힘) + 분포도 HTML 통합 반환
@@ -2389,6 +2431,38 @@ def generate_bearing_table_lrfd(cases_list, target_tier, phi_b=0.83, q_ult=500.0
 
 
 def generate_formula_html():
+    def get_formula_img(type_idx):
+        fig, ax = plt.subplots(figsize=(2.5, 1.2))
+        if type_idx == 1:
+            ax.plot([0, 1], [0, 0], 'k-', lw=2)
+            ax.add_patch(patches.Rectangle((0.3, 0), 0.4, 0.6, fill=False, lw=1.5))
+            ax.annotate("", xy=(0.5, 0), xytext=(0.5, 0.5), arrowprops=dict(arrowstyle="->", lw=1.5))
+            ax.text(0.5, 0.55, "ΣV", ha='center', va='bottom', fontweight='bold')
+            ax.annotate("", xy=(0.3, 0.3), xytext=(0.1, 0.3), arrowprops=dict(arrowstyle="->", lw=1.5))
+            ax.text(0.05, 0.3, "ΣH", ha='right', va='center', fontweight='bold')
+        elif type_idx == 2:
+            ax.plot([0, 1], [0, 0], 'k-', lw=2)
+            ax.add_patch(patches.Rectangle((0.3, 0), 0.4, 0.6, fill=False, lw=1.5))
+            ax.annotate("", xy=(0.3, 0), xytext=(0.2, 0.3), arrowprops=dict(arrowstyle="->", connectionstyle="arc3,rad=-0.5", lw=1.5))
+            ax.text(0.15, 0.35, "ΣMv", ha='center', fontweight='bold')
+            ax.annotate("", xy=(0.7, 0), xytext=(0.8, 0.3), arrowprops=dict(arrowstyle="->", connectionstyle="arc3,rad=0.5", lw=1.5))
+            ax.text(0.85, 0.35, "ΣMh", ha='center', fontweight='bold')
+        elif type_idx == 3:
+            ax.plot([0, 1], [0.8, 0.8], 'k-', lw=1.5)
+            ax.add_patch(patches.Polygon([[0.1, 0.8], [0.9, 0.8], [0.9, 0.5], [0.1, 0.6]], fill=True, facecolor='#f0f4f8', edgecolor='black'))
+            ax.text(0.5, 0.9, "e ≤ B/6", ha='center', fontsize=9)
+            ax.plot([0, 1], [0.3, 0.3], 'k-', lw=1.5)
+            ax.add_patch(patches.Polygon([[0.1, 0.3], [0.7, 0.3], [0.7, 0.0]], fill=True, facecolor='#f0f4f8', edgecolor='black'))
+            ax.text(0.5, 0.4, "e > B/6", ha='center', fontsize=9)
+        ax.set_xlim(0, 1)
+        ax.set_ylim(-0.1, 1)
+        ax.axis('off')
+        buf = io.BytesIO()
+        fig.savefig(buf, format='png', bbox_inches='tight', dpi=150)
+        plt.close(fig)
+        buf.seek(0)
+        return f"data:image/png;base64,{base64.b64encode(buf.read()).decode('utf-8')}"
+
     html = "<div style='display: flex; flex-direction: row; gap: 15px; margin-bottom: 25px; align-items: stretch;'>"
 
     html += "<div style='flex: 1; border: 1px solid #333; background: #fff; padding: 12px; display: flex; flex-direction: column; justify-content: space-between;'>"
@@ -2399,23 +2473,8 @@ def generate_formula_html():
     html += "<b>ΣV</b> : 연직력 합 (kN)<br>"
     html += "<b>ΣH</b> : 수평력 합 (kN)<br>"
     html += "<b>μ</b> : 마찰계수"
-    html += "</div>"
-    html += "</div>"
-    html += "<div style='text-align: center; margin-top: 15px;'>"
-    html += "<svg width='180' height='100' viewBox='0 0 180 100' style='background:#fff; border:1px solid #eee;'>"
-    html += "<line x1='20' y1='80' x2='160' y2='80' stroke='#000' stroke-width='2'/>"
-    html += "<rect x='50' y='30' width='80' height='50' fill='none' stroke='#000' stroke-width='1.5'/>"
-    html += "<polyline points='40,80 50,72 50,80' fill='none' stroke='#000' stroke-width='1'/>"
-    html += "<polyline points='140,80 130,72 130,80' fill='none' stroke='#000' stroke-width='1'/>"
-    html += "<line x1='90' y1='35' x2='90' y2='65' stroke='#000' stroke-width='2'/>"
-    html += "<polygon points='90,70 85,60 95,60' fill='#000'/>"
-    html += "<text x='90' y='28' text-anchor='middle' font-weight='bold' font-size='12'>ΣV</text>"
-    html += "<line x1='165' y1='50' x2='140' y2='50' stroke='#000' stroke-width='2'/>"
-    html += "<polygon points='135,50 143,45 143,55' fill='#000'/>"
-    html += "<text x='168' y='45' text-anchor='start' font-weight='bold' font-size='12'>ΣH</text>"
-    html += "</svg>"
-    html += "</div>"
-    html += "</div>"
+    html += "</div></div>"
+    html += f"<div style='text-align: center; margin-top: 15px;'><img src='{get_formula_img(1)}' style='border:1px solid #eee; max-width:180px;'></div></div>"
 
     html += "<div style='flex: 1; border: 1px solid #333; background: #fff; padding: 12px; display: flex; flex-direction: column; justify-content: space-between;'>"
     html += "<div>"
@@ -2424,23 +2483,8 @@ def generate_formula_html():
     html += "<div style='font-size: 12px; line-height: 1.5; color: #444;'>"
     html += "<b>ΣMv</b> : 연직력에 의한 모멘트 합 (kN·m)<br>"
     html += "<b>ΣMh</b> : 수평력에 의한 모멘트 합 (kN·m)"
-    html += "</div>"
-    html += "</div>"
-    html += "<div style='text-align: center; margin-top: 15px;'>"
-    html += "<svg width='180' height='100' viewBox='0 0 180 100' style='background:#fff; border:1px solid #eee;'>"
-    html += "<line x1='20' y1='80' x2='160' y2='80' stroke='#000' stroke-width='2'/>"
-    html += "<rect x='60' y='25' width='70' height='55' fill='none' stroke='#000' stroke-width='1.5'/>"
-    html += "<polyline points='45,80 55,75 60,75 60,80' fill='none' stroke='#000' stroke-width='1'/>"
-    html += "<polyline points='135,80 125,75 130,75 130,80' fill='none' stroke='#000' stroke-width='1'/>"
-    html += "<path d='M 35 60 A 18 18 0 1 1 50 72' fill='none' stroke='#000' stroke-width='2.5'/>"
-    html += "<polygon points='50,75 42,68 52,66' fill='#000'/>"
-    html += "<text x='38' y='55' font-weight='bold' font-size='11'>ΣMv</text>"
-    html += "<path d='M 115 42 A 18 18 0 1 1 95 60' fill='none' stroke='#000' stroke-width='2.5'/>"
-    html += "<polygon points='95,65 92,55 101,58' fill='#000'/>"
-    html += "<text x='105' y='52' font-weight='bold' font-size='11'>ΣMh</text>"
-    html += "</svg>"
-    html += "</div>"
-    html += "</div>"
+    html += "</div></div>"
+    html += f"<div style='text-align: center; margin-top: 15px;'><img src='{get_formula_img(2)}' style='border:1px solid #eee; max-width:180px;'></div></div>"
 
     html += "<div style='flex: 1.3; border: 1px solid #333; background: #fff; padding: 12px; display: flex; flex-direction: column; justify-content: space-between;'>"
     html += "<div>"
@@ -2451,33 +2495,8 @@ def generate_formula_html():
     html += "· <i>e</i> ≤ B/6 의 경우 : 사다리꼴 분포<br>"
     html += "· <i>e</i> &gt; B/6 의 경우 : 삼각형 분포 (B' = 3<i>x</i>, <i>q<sub>max</sub></i> = 2ΣV / B')<br><br>"
     html += "<b>ΣV</b> : 연직력 합 (kN), &nbsp;<b>B</b> : 저판의 폭 (m), &nbsp;<b>e</b> : 전합력의 편심량 (m)"
-    html += "</div>"
-    html += "</div>"
-    html += "<div style='text-align: center; margin-top: 15px;'>"
-    html += "<svg width='220' height='110' viewBox='0 0 220 110' style='background:#fff; border:1px solid #eee;'>"
-    html += "<line x1='10' y1='60' x2='210' y2='60' stroke='#000' stroke-width='1.5'/>"
-    html += "<rect x='25' y='20' width='60' height='40' fill='none' stroke='#000' stroke-width='1.2'/>"
-    html += "<line x1='55' y1='30' x2='55' y2='50' stroke='#000' stroke-width='1.5'/>"
-    html += "<polygon points='55,53 52,46 58,46' fill='#000'/>"
-    html += "<text x='62' y='42' font-size='9' font-weight='bold'>ΣV</text>"
-    html += "<line x1='55' y1='30' x2='40' y2='30' stroke='#000' stroke-width='1.5'/>"
-    html += "<polygon points='37,30 43,27 43,33' fill='#000'/>"
-    html += "<text x='42' y='24' font-size='9' font-weight='bold'>ΣH</text>"
-    html += "<line x1='55' y1='30' x2='38' y2='50' stroke='#000' stroke-width='1.8'/>"
-    html += "<polygon points='35,53 38,45 44,49' fill='#000'/>"
-    html += "<text x='30' y='42' font-size='9' font-weight='bold'>R</text>"
-    html += "<line x1='110' y1='20' x2='190' y2='20' stroke='#000' stroke-width='1'/>"
-    html += "<polygon points='110,20 110,40 190,30 190,20' fill='#f0f4f8' stroke='#000' stroke-width='1'/>"
-    html += "<text x='102' y='38' font-size='8' font-weight='bold'>p1</text>"
-    html += "<text x='193' y='28' font-size='8' font-weight='bold'>p2</text>"
-    html += "<text x='150' y='50' text-anchor='middle' font-size='9'>e ≤ B/6</text>"
-    html += "<line x1='110' y1='70' x2='190' y2='70' stroke='#000' stroke-width='1'/>"
-    html += "<polygon points='110,70 110,95 170,70' fill='#f0f4f8' stroke='#000' stroke-width='1'/>"
-    html += "<text x='102' y='92' font-size='8' font-weight='bold'>p1</text>"
-    html += "<text x='150' y='105' text-anchor='middle' font-size='9'>e &gt; B/6</text>"
-    html += "</svg>"
-    html += "</div>"
-    html += "</div>"
+    html += "</div></div>"
+    html += f"<div style='text-align: center; margin-top: 15px;'><img src='{get_formula_img(3)}' style='border:1px solid #eee; max-width:220px;'></div></div>"
 
     html += "</div>"
     return html
@@ -3231,5 +3250,21 @@ else:
 # (기존 다운로드 버튼 코드 유지)
 
 st.divider()
-st.download_button(label="📄 엑셀 완벽 대응 상세 구조계산서 다운로드 (.html)", data=rep.get_html(),
-                   file_name=f"구조계산서_{'평상시' if '평상시' in calc_mode else '지진시'}.html", mime="text/html")
+
+# =====================================================================
+# ★ 10. 통합 보고서 다운로드 렌더링 (MHTML 엔진 적용)
+# =====================================================================
+def render_fast_download(rep_obj, filename_base):
+    st.header("🖨️ 종합 구조계산서 다운로드")
+    st.info("💡 **초고속 병렬 다운로드 엔진 적용:** HTML 웹용 및 MS Word용 보고서를 즉시 생성합니다.")
+    with st.spinner("보고서용 수식과 그림을 변환 중입니다..."):
+        report_html = rep_obj.get_html()
+        mhtml_data = rep_obj.get_mhtml()
+    col1, col2 = st.columns(2)
+    with col1:
+        st.download_button("📄 구조계산서 다운로드 (HTML웹용)", data=report_html.encode('utf-8'), file_name=f"{filename_base}.html", mime="text/html", use_container_width=True)
+    with col2:
+        st.download_button("📝 구조계산서 다운로드 (MS Word용)", data=mhtml_data.encode('utf-8'), file_name=f"{filename_base}.doc", mime="application/msword", use_container_width=True)
+
+filename_suffix = "평상시" if "평상시" in calc_mode else "지진시"
+render_fast_download(rep, f"블록식_안벽_신뢰성_구조계산서_{filename_suffix}")
